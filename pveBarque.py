@@ -1,6 +1,6 @@
 from flask import Flask, request
 from flask_restful import Resource, Api, reqparse, abort
-from json import dumps,loads
+from json import dumps, loads
 from flask_jsonpify import jsonify
 from datetime import datetime
 from shutil import copyfile
@@ -10,7 +10,7 @@ import subprocess, os, time, json, multiprocessing, redis
 #defaults
 __host = "192.168.100.11"
 __port = 6969
-path = "/root/barque/"
+path = "/tank/backup/barque/"
 label = "api"
 
 app = Flask(__name__)
@@ -19,7 +19,7 @@ api = Api(app)
 r = None
 r_host = 'localhost'
 r_port = 6379
-r_pw = '**REMOVED**'
+r_pw = '**'
 workers = []
 
 parser = reqparse.RequestParser()
@@ -52,7 +52,7 @@ class Worker(multiprocessing.Process):
 		 					self.restore(job)
 		 			else:
 		 				print("{} lock unsuccessful, reentering queue".format(name))
-		 		#print(" ".join([name, str(r.hget(job, 'state'))]))
+		 		#be nice to redis
 		 		time.sleep(0.1)
 		 	time.sleep(5)
 		 	#licensed_to_live = False
@@ -88,7 +88,7 @@ class Worker(multiprocessing.Process):
 		#create compressed backup file from backup snapshot
 		dest = "".join([path, vmdisk, timestamp, ".lz4"])
 		args = ['rbd export --export-format 2 {}@barque - | lz4 -9 - {}'.format(vmdisk, dest)]
-		r.hset(vmid, 'state', 'aquiring image')
+		r.hset(vmid, 'state', 'Creating backup image')
 		try:
 			cmd = subprocess.check_output(args, shell=True)#.split('\n') #run command then convert output to list, splitting on newline
 		except:
@@ -103,6 +103,7 @@ class Worker(multiprocessing.Process):
 		r.hset(vmid, 'state', 'complete')
 		r.srem('joblock', vmid)
 		return
+
 	def restore(self, vmid):
 		r.hset(vmid, 'state', 'active')
 		filename = r.hget(vmid, 'file')
@@ -131,7 +132,7 @@ class Worker(multiprocessing.Process):
 			elif time.time() > timeout:
 				return "timeout - unable to stop container", 500
 		#make recovery copy of container image
-		r.hset(vmid, 'state', 'creating recovery image')
+		r.hset(vmid, 'state', 'creating disaster recovery image')
 		imgcpy = subprocess.check_output("rbd cp {} {}-barque".format(vmdisk, vmdisk), shell=True)
 		#delete container storage
 		r.hset(vmid, 'state', 'removing container image')
@@ -139,9 +140,18 @@ class Worker(multiprocessing.Process):
 			imgdel = subprocess.check_output("pvesh delete /nodes/{}/storage/rbd_ct/content/rbd_ct:{}".format(node, vmdisk), shell=True)
 			print(imgdel)
 		except:
-			r.hset(vmid, 'state', 'error')
-			r.hset(vmid, 'msg', "unable to remove container image")
-			return
+			try: #attempt to force unmap image if has watchers
+				cmd = subprocess.check_output("rbd unmap -o force {}".format(vmdisk))
+			except:
+				r.hset(vmid, 'state', 'error')
+				r.hset(vmid, 'msg', "unable to unmap container image", shell=True)
+				return
+			try: #retry deleting image
+				cmd = subprocess.check_output("pvesh delete /nodes/{}/storage/rbd_ct/content/rbd_ct:{}".format(node, vmdisk), shell=True)
+			except:
+				r.hset(vmid, 'state', 'error')
+				r.hset(vmid, 'msg', "unable to remove container image", shell=True)
+				return
 		#extract lz4 compressed image file
 		filetarget = "".join([path, filename, ".img"])
 		uncompress = subprocess.check_output("lz4 -d {} {}".format(fileimg, filetarget), shell=True)
@@ -179,8 +189,11 @@ class Worker(multiprocessing.Process):
 
 class Backup(Resource):
 	def post(self, vmid):
+		if 'retry' in request.args and r.hget(vmid, 'state') == 'error':
+			r.srem('joblock', vmid)
 		if str(vmid) in r.smembers('joblock'):
-			return {'error':"VMID locked, another operation is in progress for container: {}".format(vmid)}, 400
+			return {'error':"VMID locked, another operation is in progress for container: {}".format(vmid), 
+				'status': r.hget(vmid,'state'),'job':r.hget(vmid, 'job')}, 400
 		else:
 			r.hset(vmid, 'job','backup')
 			r.hset(vmid, 'file', '')
@@ -246,7 +259,7 @@ class ListAllBackups(Resource):
 
 class ListBackups(Resource):
 	def get(self, vmid):
-		files = sorted(os.path.basename(f) for f in glob("".join([path, "vm-{}*.lz4".format(vmid)])))
+		files = sorted(os.path.basename(f) for f in glob("".join([path, "vm-{}-disk-1*.lz4".format(vmid)])))
 		return {'backups': files}
 class DeleteBackup(Resource):
 	def post(self,vmid):
@@ -284,6 +297,8 @@ class Status(Resource):
 class AllStatus(Resource):
 	def get(self):
 		response = []
+		for worker in workers:
+			print(worker)
 		for vmid in r.smembers('joblock'):
 			status = r.hget(vmid, 'state')
 			if status == 'error':
@@ -305,13 +320,14 @@ api.add_resource(AllStatus, '/barque/all/status')
 
 def sanitize():
 	for item in r.smembers('joblock'):
-		if r.hget(item, 'state') is not 'error':
+		status = r.hget(item, 'state')
+		if status != 'error':
 			r.srem('joblock',item)
 if __name__ == '__main__':
 	r = redis.Redis(host=r_host, port=r_port, password=r_pw)
 	sanitize()
 	print("redis connection successful")
-	for i in range(1):
+	for i in range(5):
 		p = Worker()
 		workers.append(p)
 		p.start()
