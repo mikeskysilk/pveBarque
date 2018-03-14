@@ -8,20 +8,19 @@ from glob import glob
 import subprocess, os, time, json, multiprocessing, redis
 
 #defaults
-__host = "192.168.100.11"
-__port = 6969
-path = "/tank/backup/barque/"
-label = "api"
+__host = "172.17.40.61"				#ip address for API to bind to
+__port = 9737						#port for API to bind to
+path = "/mnt/pve/d6000/pveBarque/"	#Destination path for backups, terminating / required
+pool = "rbd3/"						#Ceph RBD pool, terminating / required. Leave empty for default
+r_host = 'localhost'				#Redis server host
+r_port = 9736						#Redis server port
+r_pw = '**'		#Redis server password
 
+#global vars
 app = Flask(__name__)
 api = Api(app)
-
 r = None
-r_host = 'localhost'
-r_port = 6379
-r_pw = '**'
 workers = []
-
 parser = reqparse.RequestParser()
 parser.add_argument('file','vmid')
 
@@ -75,7 +74,7 @@ class Worker(multiprocessing.Process):
 			return
 		#create snapshot for backup
 		try:
-			cmd = subprocess.check_output('rbd snap create {}@barque'.format(vmdisk), shell=True)
+			cmd = subprocess.check_output('rbd snap create {}{}@barque'.format(pool, vmdisk), shell=True)
 		except:
 			r.hset(vmid, 'state', 'error')
 			r.hset(vmid, 'msg', 'error creating backup snapshot')
@@ -84,10 +83,10 @@ class Worker(multiprocessing.Process):
 		config_dest = "".join([path, vmdisk, timestamp, ".conf"])
 		copyfile(config_file, config_dest)
 		#protect snapshot during backup
-		cmd = subprocess.check_output('rbd snap protect {}@barque'.format(vmdisk), shell=True)
+		cmd = subprocess.check_output('rbd snap protect {}{}@barque'.format(pool, vmdisk), shell=True)
 		#create compressed backup file from backup snapshot
 		dest = "".join([path, vmdisk, timestamp, ".lz4"])
-		args = ['rbd export --export-format 2 {}@barque - | lz4 -9 - {}'.format(vmdisk, dest)]
+		args = ['rbd export --export-format 2 {}{}@barque - | lz4 -9 - {}'.format(pool, vmdisk, dest)]
 		r.hset(vmid, 'state', 'Creating backup image')
 		try:
 			cmd = subprocess.check_output(args, shell=True)#.split('\n') #run command then convert output to list, splitting on newline
@@ -96,9 +95,9 @@ class Worker(multiprocessing.Process):
 			r.hset(vmid, 'msg', 'unable to aquire rbd image for CTID: {}'.format(vmid))
 			return
 		#unprotect barque snapshot
-		cmd = subprocess.check_output('rbd snap unprotect {}@barque'.format(vmdisk), shell=True)
+		cmd = subprocess.check_output('rbd snap unprotect {}{}@barque'.format(pool, vmdisk), shell=True)
 		#delete barque snapshot
-		cmd = subprocess.check_output('rbd snap rm {}@barque'.format(vmdisk), shell=True)
+		cmd = subprocess.check_output('rbd snap rm {}{}@barque'.format(pool, vmdisk), shell=True)
 		#mark complete and unlock CTID
 		r.hset(vmid, 'state', 'complete')
 		r.srem('joblock', vmid)
@@ -133,7 +132,7 @@ class Worker(multiprocessing.Process):
 				return "timeout - unable to stop container", 500
 		#make recovery copy of container image
 		r.hset(vmid, 'state', 'creating disaster recovery image')
-		imgcpy = subprocess.check_output("rbd cp {} {}-barque".format(vmdisk, vmdisk), shell=True)
+		imgcpy = subprocess.check_output("rbd cp {}{} {}{}-barque".format(pool, vmdisk, pool, vmdisk), shell=True)
 		#delete container storage
 		r.hset(vmid, 'state', 'removing container image')
 		try:
@@ -141,10 +140,10 @@ class Worker(multiprocessing.Process):
 			print(imgdel)
 		except:
 			try: #attempt to force unmap image if has watchers
-				cmd = subprocess.check_output("rbd unmap -o force {}".format(vmdisk))
+				cmd = subprocess.check_output("rbd unmap -o force {}{}".format(pool, vmdisk))
 			except:
 				r.hset(vmid, 'state', 'error')
-				r.hset(vmid, 'msg', "unable to unmap container image", shell=True)
+				r.hset(vmid, 'msg', "unable to unmap container image")
 				return
 			try: #retry deleting image
 				cmd = subprocess.check_output("pvesh delete /nodes/{}/storage/rbd_ct/content/rbd_ct:{}".format(node, vmdisk), shell=True)
@@ -159,19 +158,19 @@ class Worker(multiprocessing.Process):
 		#import new image
 		r.hset(vmid, 'state', 'importing backup image')
 		try:
-			rbdimp = subprocess.check_output("rbd import --export-format 2 {} {}".format(filetarget, vmdisk), shell=True)
+			rbdimp = subprocess.check_output("rbd import --export-format 2 {} {}{}".format(filetarget, pool, vmdisk), shell=True)
 			print(rbdimp)
 		except:
 			r.hset(vmid, 'state','error')
 			r.hset(vmid, 'msg', rbdimp)
-			cmd = subprocess.check_output("rbd mv {}-barque {}".format(vmdisk, vmdisk), shell=True)
+			cmd = subprocess.check_output("rbd mv {}{}-barque {}{}".format(pool, vmdisk, pool, vmdisk), shell=True)
 			return
 		#delete uncompressed image file
 		r.hset(vmid, 'state', 'cleaning up')
 		rmuncomp = subprocess.check_output("rm {}".format(filetarget), shell=True)
 		print(rmuncomp)
 		#delete barque snapshot
-		cmd = subprocess.check_output('rbd snap rm {}@barque'.format(vmdisk), shell=True)
+		cmd = subprocess.check_output('rbd snap rm {}{}@barque'.format(pool, vmdisk), shell=True)
 		#image attenuation for kernel params #Removed after switching to format 2
 		# imgatten = subprocess.check_output("rbd feature disable {} object-map fast-diff deep-flatten".format(vmdisk), shell=True)
 		# print(imgatten)
@@ -182,7 +181,7 @@ class Worker(multiprocessing.Process):
 		time.sleep(5)
 		print(ctstart)
 		#cleanup recovery copy
-		cmd = subprocess.check_output("rbd rm {}-barque".format(vmdisk), shell=True)
+		cmd = subprocess.check_output("rbd rm {}{}-barque".format(pool, vmdisk), shell=True)
 		r.hset(vmid, 'state','complete')
 		r.srem('joblock', vmid)
 		return
