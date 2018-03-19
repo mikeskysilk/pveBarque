@@ -5,16 +5,19 @@ from flask_jsonpify import jsonify
 from datetime import datetime
 from shutil import copyfile
 from glob import glob
-import subprocess, os, time, json, multiprocessing, redis
+import subprocess, os, time, json, multiprocessing, redis, configparser
 
-#defaults
-__host = "172.17.40.61"				#ip address for API to bind to
-__port = 9737						#port for API to bind to
-path = "/mnt/pve/d6000/pveBarque/"	#Destination path for backups, terminating / required
-pool = "rbd3/"						#Ceph RBD pool, terminating / required. Leave empty for default
-r_host = 'localhost'				#Redis server host
-r_port = 9736						#Redis server port
-r_pw = '**'		#Redis server password
+config = configparser.ConfigParser()
+config.read('barque.conf')
+#configs
+__host = config['flask']['host']				#ip address for API to bind to
+__port = int(config['flask']['port'])			#port for API to bind to
+path = config['settings']['path']				#Destination path for backups, terminating / required
+pool = config['settings']['pool']				#Ceph RBD pool, terminating / required. Leave empty for default
+minions = int(config['settings']['workers'])	#number of worker processes to spawn
+r_host = config['redis']['host']				#Redis server host
+r_port = int(config['redis']['port'])			#Redis server port
+r_pw = config['redis']['password']				#Redis server password
 
 #global vars
 app = Flask(__name__)
@@ -49,6 +52,8 @@ class Worker(multiprocessing.Process):
 		 					self.backup(job)
 		 				elif task == 'restore':
 		 					self.restore(job)
+		 				elif task == 'scrub':
+		 					self.scrubSnaps(job)
 		 			else:
 		 				print("{} lock unsuccessful, reentering queue".format(name))
 		 		#be nice to redis
@@ -56,6 +61,7 @@ class Worker(multiprocessing.Process):
 		 	time.sleep(5)
 		 	#licensed_to_live = False
 	 	return
+
 	def backup(self,vmid):
 		r.hset(vmid, 'state','active')
 		vmdisk = 'vm-{}-disk-1'.format(vmid)
@@ -86,7 +92,7 @@ class Worker(multiprocessing.Process):
 		cmd = subprocess.check_output('rbd snap protect {}{}@barque'.format(pool, vmdisk), shell=True)
 		#create compressed backup file from backup snapshot
 		dest = "".join([path, vmdisk, timestamp, ".lz4"])
-		args = ['rbd export --export-format 2 {}{}@barque - | lz4 -9 - {}'.format(pool, vmdisk, dest)]
+		args = ['rbd export --export-format 2 {}{}@barque - | lz4 -1 - {}'.format(pool, vmdisk, dest)]
 		r.hset(vmid, 'state', 'Creating backup image')
 		try:
 			cmd = subprocess.check_output(args, shell=True)#.split('\n') #run command then convert output to list, splitting on newline
@@ -136,7 +142,7 @@ class Worker(multiprocessing.Process):
 		#delete container storage
 		r.hset(vmid, 'state', 'removing container image')
 		try:
-			imgdel = subprocess.check_output("pvesh delete /nodes/{}/storage/rbd_ct/content/rbd_ct:{}".format(node, vmdisk), shell=True)
+			imgdel = subprocess.check_output("pvesh delete /nodes/{}/storage/vdisk-3pg/content/vdisk-3pg:{}".format(node, vmdisk), shell=True)
 			print(imgdel)
 		except:
 			try: #attempt to force unmap image if has watchers
@@ -146,7 +152,7 @@ class Worker(multiprocessing.Process):
 				r.hset(vmid, 'msg', "unable to unmap container image")
 				return
 			try: #retry deleting image
-				cmd = subprocess.check_output("pvesh delete /nodes/{}/storage/rbd_ct/content/rbd_ct:{}".format(node, vmdisk), shell=True)
+				cmd = subprocess.check_output("pvesh delete /nodes/{}/storage/vdisk-3pg/content/vdisk-3pg:{}".format(node, vmdisk), shell=True)
 			except:
 				r.hset(vmid, 'state', 'error')
 				r.hset(vmid, 'msg', "unable to remove container image", shell=True)
@@ -186,13 +192,46 @@ class Worker(multiprocessing.Process):
 		r.srem('joblock', vmid)
 		return
 
+	def scrubSnaps(self, vmid): 
+		r.hset(vmid, 'state', 'active')
+		vmdisk = 'vm-{}-disk-1'.format(vmid)
+		try:
+			cmd = subprocess.check_output('rbd snap unprotect {}{}@barque'.format(pool, vmdisk), shell=True)
+		except:
+			#could not unprotect, maybe snap wasn't protected
+			try:
+				cmd = subprocess.check_output('rbd snap rm {}{}@barque'.format(pool, vmdisk), shell=True)
+			except:
+				r.hset(vmid, 'state', 'error')
+				r.hset(vmid, 'msg', "critical snapshotting error: unable to unprotect or remove")
+				return
+			#snapshot successfully removed, set OK
+			r.hset(vmid, 'state', 'OK')
+			r.hset(vmid, 'msg', 'snapshot successfully scrubbed - removed only')
+			return
+		#snapshot successfully unprotected, attempt removal
+		try:
+			cmd = subprocess.check_output('rbd snap rm {}{}@barque'.format(pool, vmdisk), shell=True)
+		except:
+			r.hset(vmid, 'state', 'error')
+			r.hset(vmid, 'msg', 'critical snapshotting error: snap unprotected but unable to remove')
+			return
+		#snapshot successfully removed, set OK
+		r.hset(vmid, 'state', 'OK')
+		r.hset(vmid, 'msg', 'snapshot successfully scrubbed - unprotected and removed')
+		retry = r.hget(vmid, 'retry')
+		if retry == 'backup': #REMOVE - used for testing snap scrubbing
+			r.hset(vmid, 'job', 'backup')
+			r.hset(vmid, 'state', 'enqueued')
+		return
+
 class Backup(Resource):
 	def post(self, vmid):
 		if 'retry' in request.args and r.hget(vmid, 'state') == 'error':
 			r.srem('joblock', vmid)
 		if str(vmid) in r.smembers('joblock'):
 			return {'error':"VMID locked, another operation is in progress for container: {}".format(vmid), 
-				'status': r.hget(vmid,'state'),'job':r.hget(vmid, 'job')}, 400
+				'status': r.hget(vmid,'state'),'job':r.hget(vmid, 'job')}, 409
 		else:
 			r.hset(vmid, 'job','backup')
 			r.hset(vmid, 'file', '')
@@ -200,7 +239,7 @@ class Backup(Resource):
 			r.hset(vmid, 'state', 'enqueued')
 			r.sadd('joblock', vmid)
 
-		return {'status': "backup job created for CTID {}".format(vmid)}, 201
+		return {'status': "backup job created for CTID {}".format(vmid)}, 202
 
 class BackupAll(Resource):
 	def post(self):
@@ -234,7 +273,7 @@ class Restore(Resource):
 		if not os.path.isfile(fileimg) and not os.path.isfile(fileconf):
 			return {'error': "unable to proceed, backup file or config file (or both) does not exist"}, 400	
 		if str(vmid) in r.smembers('joblock'):
-			return {'error':"VMID locked, another operation is in progress for container: {}".format(vmid)}, 400
+			return {'error':"VMID locked, another operation is in progress for container: {}".format(vmid)}, 409
 
 		r.hset(vmid, 'job','restore')
 		r.hset(vmid, 'file', filename)
@@ -242,7 +281,7 @@ class Restore(Resource):
 		r.hset(vmid, 'state', 'enqueued')
 		r.sadd('joblock', vmid)
 
-		return {'status': "restore job created for CTID {}".format(vmid)}, 201
+		return {'status': "restore job created for CTID {}".format(vmid)}, 202
 
 class ListAllBackups(Resource):
 	def get(self):
@@ -263,7 +302,7 @@ class ListBackups(Resource):
 class DeleteBackup(Resource):
 	def post(self,vmid):
 		if str(vmid) in r.smembers('joblock'):
-			return {'error': 'CTID locked, another operation is in progress for container {}'.format(vmid)}, 400
+			return {'error': 'CTID locked, another operation is in progress for container {}'.format(vmid)}, 409
 		r.hset(vmid, 'state', 'locked')
 		r.hset(vmid, 'job', 'delete')
 		r.sadd('joblock', vmid)
@@ -279,20 +318,26 @@ class DeleteBackup(Resource):
 				return {'file removed': os.path.basename(fileimg)}
 			else:
 				r.srem('joblock', vmid)
-				return {'file does not exist': os.path.basename(fileimg)}
+				return {'file does not exist': os.path.basename(fileimg)}, 400
 		else:
 			r.srem('joblock', vmid)
 			return "resource requires a file argument", 400
 
 class Status(Resource):
 	def get(self, vmid):
+		response = []
 		if str(vmid) in r.smembers('joblock'):
 			status = r.hget(vmid, 'state')
-			if status == 'error':
-				msg = r.hget(vmid, 'msg')
-				return {'status': status, 'error message': msg}, 401
-			return {'status': status}, 200
+			msg = r.hget(vmid, 'msg')
+			job = r.hget(vmid, 'job')
+			response.append({"status": status})
+			response.append({"message" : msg})
+			response.append({"job": job})
+			if job == 'restore':
+				response.append({"file": r.hget(vmid, 'file')})
+			return {vmid: response}, 200
 		return {'status': "No active tasks"}
+
 class AllStatus(Resource):
 	def get(self):
 		response = []
@@ -306,7 +351,32 @@ class AllStatus(Resource):
 			else:
 				response.append({"CTID": vmid, "status": "OK", "message": status})
 		return response
-
+class ClearQueue(Resource):
+	def post(self):
+		response = []
+		for vmid in r.smembers('joblock'):
+			status = r.hget(vmid, 'state')
+			if status == 'enqueued':
+				r.srem('joblock', vmid)
+				r.hset(vmid, 'state', 'OK')
+				response.append({"CTID": vmid, "status":"OK", "message":"Successfully dequeued"})
+			else:
+				msg = r.hget(vmid, 'msg')
+				response.append({"CTID": vmid, "status": status, "message": msg})
+		return response
+class CleanSnaps(Resource):
+	def post(self):
+		response = []
+		for vmid in r.smembers('joblock'):
+			status = r.hget(vmid, 'state')
+			msg = r.hget(vmid, 'msg')
+			job = r.hget(vmid, 'job') #REMOVE- used for testing scrub functions
+			if (status == 'error') and (msg == "error creating backup snapshot"):
+				#add to scrub queue
+				if job == 'backup': #REMOVE - used for testing scrub functions
+					r.hset(vmid, 'retry', 'backup')
+				r.hset(vmid, 'job', 'scrub')
+				r.hset(vmid, 'state', 'enqueued')
 
 api.add_resource(ListAllBackups, '/barque/')
 api.add_resource(ListBackups, '/barque/<int:vmid>')
@@ -316,6 +386,8 @@ api.add_resource(Restore, '/barque/<int:vmid>/restore')
 api.add_resource(DeleteBackup, '/barque/<int:vmid>/delete')
 api.add_resource(Status, '/barque/<int:vmid>/status')
 api.add_resource(AllStatus, '/barque/all/status')
+api.add_resource(ClearQueue, '/barque/all/clear')
+api.add_resource(CleanSnaps, '/barque/all/clean')
 
 def sanitize():
 	for item in r.smembers('joblock'):
@@ -326,7 +398,7 @@ if __name__ == '__main__':
 	r = redis.Redis(host=r_host, port=r_port, password=r_pw)
 	sanitize()
 	print("redis connection successful")
-	for i in range(5):
+	for i in range(minions):
 		p = Worker()
 		workers.append(p)
 		p.start()
