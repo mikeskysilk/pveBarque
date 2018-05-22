@@ -6,7 +6,7 @@ from datetime import datetime
 from shutil import copyfile
 from glob import glob
 from flask_httpauth import HTTPBasicAuth
-import subprocess, os, time, json, multiprocessing, redis, configparser, itertools
+import subprocess, os, time, json, multiprocessing, redis, configparser, itertools, ssl
 
 config = configparser.ConfigParser()
 config.read('barque.conf')
@@ -23,6 +23,10 @@ minions = int(config['settings']['workers'])	#number of worker processes to spaw
 r_host = config['redis']['host']				#Redis server host
 r_port = int(config['redis']['port'])			#Redis server port
 r_pw = config['redis']['password']				#Redis server password
+locations = {}									#backup storage destinations
+for option in config.options('destinations'):
+	locations[option] = config.get('destinations', option)
+
 
 #global vars
 app = Flask(__name__)
@@ -61,6 +65,10 @@ class Worker(multiprocessing.Process):
 		 					self.restore(job)
 		 				elif task == 'scrub':
 		 					self.scrubSnaps(job)
+		 				elif task == 'import':
+		 					self.migrate(job)
+		 				else:
+		 					print("{} unable to determine task...".format(name))
 		 			else:
 		 				print("{} lock unsuccessful, reentering queue".format(name))
 		 		#be nice to redis
@@ -72,6 +80,7 @@ class Worker(multiprocessing.Process):
 	def backup(self,vmid):
 		storage = None
 		vmdisk = None
+		destination = r.hget(vmid, 'dest')
 		r.hset(vmid, 'state','active')
 		#vmdisk = 'vm-{}-disk-1'.format(vmid)
 		timestamp = datetime.strftime(datetime.now(),"_%Y-%m-%d_%H-%M")
@@ -95,7 +104,12 @@ class Worker(multiprocessing.Process):
 		with open(config_file) as lines:
 			lines = itertools.chain(("[root]",), lines)
 			parser.read_file(lines)
-		storage, vmdisk = parser['root']['rootfs'].split(',')[0].split(':')
+		try:
+			storage, vmdisk = parser['root']['rootfs'].split(',')[0].split(':')
+		except:
+			r.hset(vmid, 'state', 'error')
+			r.hset(vmid, 'msg','unable to get storage info from config file')
+			return
 		print(storage)
 		print(vmdisk)
 
@@ -108,15 +122,15 @@ class Worker(multiprocessing.Process):
 			return
 
 		#copy config file
-		config_dest = "".join([path, vmdisk, timestamp, ".conf"])
+		config_dest = "".join([destination, vmdisk, timestamp, ".conf"])
 		copyfile(config_file, config_dest)
 
 		#protect snapshot during backup
 		cmd = subprocess.check_output('rbd snap protect {}{}@barque'.format(pool, vmdisk), shell=True)
 
 		#create compressed backup file from backup snapshot
-		dest = "".join([path, vmdisk, timestamp, ".lz4"])
-		args = ['rbd export --export-format 2 {}{}@barque - | lz4 -1 - {}'.format(pool, vmdisk, dest)]
+		dest = "".join([destination, vmdisk, timestamp, ".lz4"])
+		args = ['rbd export --rbd-concurrent-management-ops 20 --export-format 2 {}{}@barque - | lz4 -1 - {}'.format(pool, vmdisk, dest)]
 		r.hset(vmid, 'state', 'Creating backup image')
 		try:
 			cmd = subprocess.check_output(args, shell=True)#.split('\n') #run command then convert output to list, splitting on newline
@@ -137,13 +151,15 @@ class Worker(multiprocessing.Process):
 		return
 
 	def restore(self, vmid):
-		r.hset(vmid, 'state', 'active')
-		filename = r.hget(vmid, 'file')
 		config_file = ""
 		node = ""
+		destination = r.hget(vmid, 'dest')
+		filename = r.hget(vmid, 'file')
+		r.hset(vmid, 'state', 'active')
+
 		#vmdisk = 'vm-{}-disk-1'.format(vmid)
-		fileimg = "".join([path, filename, ".lz4"])
-		fileconf = "".join([path, filename, ".conf"])
+		fileimg = "".join([destination, filename, ".lz4"])
+		fileconf = "".join([destination, filename, ".conf"])
 		
 		#find node hosting container
 		config_target = "{}.conf".format(vmid)
@@ -161,18 +177,25 @@ class Worker(multiprocessing.Process):
 		with open(config_file) as lines:
 			lines = itertools.chain(("[root]",), lines)
 			parserCurr.read_file(lines)
-		storage_current, vmdisk_current = parserCurr['root']['rootfs'].split(',')[0].split(':')
-
+		try:
+			storage_current, vmdisk_current = parserCurr['root']['rootfs'].split(',')[0].split(':')
+		except:
+			r.hset(vmid, 'state', 'error')
+			r.hset(vmid, 'msg', 'unable to get storage info from active config file')
+			return
 		#get storage info from config file
 		parserFinal = configparser.ConfigParser()
 		with open(fileconf) as lines:
 			lines = itertools.chain(("[root]",), lines)
 			parserFinal.read_file(lines)
-		storage_final, vmdisk_final = parserFinal['root']['rootfs'].split(',')[0].split(':')
-
+		try:
+			storage_final, vmdisk_final = parserFinal['root']['rootfs'].split(',')[0].split(':')
+		except:
+			r.hset(vmid, 'state', 'error')
+			r.hset(vmid, 'msg', 'unable to get storage info from backup config file')
 		#stop container if not already stopped
 		r.hset(vmid, 'state', 'stopping container')
-		if not loads(subprocess.check_output("pvesh get /nodes/{}/lxc/{}/status/current".format(node,vmid), shell=True))["status"] == "stopped":
+		if not loads(subprocess.check_output("pvesh get /nodes/{}/lxc/{}/status/current".format(node, vmid), shell=True))["status"] == "stopped":
 			ctstop = subprocess.check_output("pvesh create /nodes/{}/lxc/{}/status/stop".format(node, vmid), shell=True)
 		timeout = time.time() + 60
 		while True: #wait for container to stop
@@ -185,7 +208,8 @@ class Worker(multiprocessing.Process):
 		
 		#make recovery copy of container image
 		r.hset(vmid, 'state', 'creating disaster recovery image')
-		imgcpy = subprocess.check_output("rbd cp {}{} {}{}-barque".format(pool, vmdisk_current, pool, vmdisk_current), shell=True)
+		imgcpy = subprocess.check_output("rbd cp --rbd-concurrent-management-ops 20 {}{} {}{}-barque".format(pool, 
+			vmdisk_current, pool, vmdisk_current), shell=True)
 		
 		#delete container storage
 		r.hset(vmid, 'state', 'removing container image')
@@ -210,14 +234,14 @@ class Worker(multiprocessing.Process):
 				return
 		
 		#extract lz4 compressed image file
-		filetarget = "".join([path, filename, ".img"])
+		filetarget = "".join([destination, filename, ".img"])
 		uncompress = subprocess.check_output("lz4 -d {} {}".format(fileimg, filetarget), shell=True)
 		print(uncompress)
 		
 		#import new image
 		r.hset(vmid, 'state', 'importing backup image')
 		try:
-			rbdimp = subprocess.check_output("rbd import --export-format 2 {} {}{}".format(filetarget, pool, vmdisk_final), shell=True)
+			rbdimp = subprocess.check_output("rbd import --rbd-concurrent-management-ops 20 --export-format 2 {} {}{}".format(filetarget, pool, vmdisk_final), shell=True)
 			print(rbdimp)
 		except:
 			r.hset(vmid, 'state','error')
@@ -292,20 +316,32 @@ class Worker(multiprocessing.Process):
 		r.hset(vmid, 'state', 'OK')
 		r.hset(vmid, 'msg', 'snapshot successfully scrubbed - unprotected and removed')
 		retry = r.hget(vmid, 'retry')
-		if retry == 'backup': #REMOVE - used for testing snap scrubbing
-			r.hset(vmid, 'job', 'backup')
-			r.hset(vmid, 'state', 'enqueued')
+		# if retry == 'backup': #REMOVE - used for testing snap scrubbing
+		# 	r.hset(vmid, 'job', 'backup')
+		# 	r.hset(vmid, 'state', 'enqueued')
 		return
+
+	def migrate(self, vmid):
+		pass
 
 class Backup(Resource):
 	@auth.login_required
 	def post(self, vmid):
-		#clear error and try again if retry flag in request args
-		if 'retry' in request.args and r.hget(vmid, 'state') == 'error':
-			r.srem('joblock', vmid)
 		#catch if container does not exist
 		if not checkConf(vmid):
 			return {'error':"{} is not a valid CTID"}, 400
+		#clear error and try again if retry flag in request args
+		if 'retry' in request.args and r.hget(vmid, 'state') == 'error':
+			r.srem('joblock', vmid)
+		#handle destination setting
+		if 'dest' in request.args:
+			result, response, err = checkDest(request.args['dest'])
+			if result:
+				r.hset(vmid, 'dest', locations[request.args['dest']])
+			else:
+				return response, err
+		else:
+			r.hset(vmid, 'dest', locations[locations.keys()[0]])
 		if str(vmid) in r.smembers('joblock'):
 			return {'error':"VMID locked, another operation is in progress for container: {}".format(vmid), 
 				'status': r.hget(vmid,'state'),'job':r.hget(vmid, 'job')}, 409
@@ -318,7 +354,15 @@ class Backup(Resource):
 			r.sadd('joblock', vmid)
 
 		return {'status': "backup job created for CTID {}".format(vmid)}, 202
-
+def checkDest(dest):
+	if dest in locations:
+		directory = locations[dest]
+		if os.path.exists(directory):
+			return True, None, None
+		else:
+			return False, {'error':'{} is not currently accessible'.format(directory)}, 500
+	else:
+		return False, {'error':'{} is not a configured destination'.format(dest)}, 400
 class BackupAll(Resource):
 	@auth.login_required
 	def post(self):
@@ -344,9 +388,22 @@ class BackupAll(Resource):
 class Restore(Resource):
 	@auth.login_required
 	def post(self,vmid):
+		path = None
+		#handle destination setting
+		if 'dest' in request.args:
+			result, response, err = checkDest(request.args['dest'])
+			if result:
+				path = locations[request.args['dest']]
+			else:
+				return response, err
+		else:
+			path = locations[locations.keys()[-1]]
+		#check if file specified
 		if 'file' not in request.args:
 			return {'error': 'Resource requires a file argument'}, 400
 		filename = os.path.splitext(request.args['file'])[0]
+		if not filename.split('-')[1] == str(vmid):
+			return {'error': 'File name does not match VMID'}, 400
 		fileimg = "".join([path, filename, ".lz4"])
 		fileconf = "".join([path, filename, ".conf"])
 		
@@ -363,6 +420,7 @@ class Restore(Resource):
 		r.hset(vmid, 'file', filename)
 		r.hset(vmid, 'worker', '')
 		r.hset(vmid, 'msg', '')
+		r.hset(vmid, 'dest', path)
 		r.hset(vmid, 'state', 'enqueued')
 		r.sadd('joblock', vmid)
 
@@ -371,6 +429,16 @@ class Restore(Resource):
 class ListAllBackups(Resource):
 	@auth.login_required
 	def get(self):
+		path = None
+		#handle destination setting
+		if 'dest' in request.args:
+			result, response, err = checkDest(request.args['dest'])
+			if result:
+				path = locations[request.args['dest']]
+			else:
+				return response, err
+		else:
+			path = locations[locations.keys()[-1]]
 		result = []
 		confs = []
 		for paths, dirs, files in os.walk(path):
@@ -384,6 +452,15 @@ class ListAllBackups(Resource):
 class ListBackups(Resource):
 	@auth.login_required
 	def get(self, vmid):
+		path = None
+		if 'dest' in request.args:
+			result, response, err = checkDest(request.args['dest'])
+			if result:
+				path = locations[request.args['dest']]
+			else:
+				return response, err
+		else:
+			path = locations[locations.keys()[-1]]
 		files = sorted(os.path.basename(f) for f in glob("".join([path, "vm-{}-disk*.lz4".format(vmid)])))
 		return {'backups': files}
 class DeleteBackup(Resource):
@@ -391,10 +468,10 @@ class DeleteBackup(Resource):
 	def post(self,vmid):
 		if str(vmid) in r.smembers('joblock'):
 			return {'error': 'CTID locked, another operation is in progress for container {}'.format(vmid)}, 409
-		r.hset(vmid, 'state', 'locked')
-		r.hset(vmid, 'job', 'delete')
-		r.sadd('joblock', vmid)
 		if 'file' in request.args:
+			if request.args['file'].split('-')[1] is not str(vmid):
+				return {'error': 'File name does not match VMID'}, 400
+			r.sadd('joblock', vmid)
 			print(request.args['file'])
 			fileimg = "".join([path, request.args['file']])
 			fileconf = "".join([os.path.splitext(fileimg)[0],".conf"])
@@ -408,8 +485,7 @@ class DeleteBackup(Resource):
 				r.srem('joblock', vmid)
 				return {'file does not exist': os.path.basename(fileimg)}, 400
 		else:
-			r.srem('joblock', vmid)
-			return "resource requires a file argument", 400
+			return {'error':"resource requires a file argument"}, 400
 
 class Status(Resource):
 	@auth.login_required
@@ -447,10 +523,10 @@ class ClearQueue(Resource):
 			if status == 'enqueued':
 				r.srem('joblock', vmid)
 				r.hset(vmid, 'state', 'OK')
-				response.append({"CTID": vmid, "status":"OK", "message":"Successfully dequeued"})
+				response.append({vmid: {"status":"OK", "message":"Successfully dequeued"}})
 			else:
 				msg = r.hget(vmid, 'msg')
-				response.append({"CTID": vmid, "status": status, "message": msg})
+				response.append({vmid: {'status':status, 'message':msg, 'job':job, 'file': file}})
 		return response
 
 class CleanSnaps(Resource):
@@ -463,8 +539,8 @@ class CleanSnaps(Resource):
 			job = r.hget(vmid, 'job') #REMOVE- used for testing scrub functions
 			if (status == 'error') and (msg == "error creating backup snapshot"):
 				#add to scrub queue
-				if job == 'backup': #REMOVE - used for testing scrub functions
-					r.hset(vmid, 'retry', 'backup')
+				# if job == 'backup': #REMOVE - used for testing scrub functions
+				# 	r.hset(vmid, 'retry', 'backup')
 				r.hset(vmid, 'job', 'scrub')
 				r.hset(vmid, 'state', 'enqueued')
 
