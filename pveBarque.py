@@ -67,6 +67,8 @@ class Worker(multiprocessing.Process):
 		 					self.scrubSnaps(job)
 		 				elif task == 'import':
 		 					self.migrate(job)
+		 				elif task == 'poisoned':
+		 					self.poison(job)
 		 				else:
 		 					print("{} unable to determine task...".format(name))
 		 			else:
@@ -83,7 +85,7 @@ class Worker(multiprocessing.Process):
 		destination = r.hget(vmid, 'dest')
 		r.hset(vmid, 'state','active')
 		#vmdisk = 'vm-{}-disk-1'.format(vmid)
-		timestamp = datetime.strftime(datetime.now(),"_%Y-%m-%d_%H-%M")
+		timestamp = datetime.strftime(datetime.utcnow(),"_%Y-%m-%d_%H-%M-%S")
 		config_file = ""
 		config_target = "{}.conf".format(vmid)
 		#get config file
@@ -113,6 +115,13 @@ class Worker(multiprocessing.Process):
 		print(storage)
 		print(vmdisk)
 
+		#check if poisoned 1
+		if r.hget(vmid, 'job') == 'poisoned':
+			r.srem('joblock', vmid)
+			r.hset(vmid, 'msg', 'Task successfully cancelled')
+			r.hset(vmid, 'state', 'OK')
+			return
+
 		#create snapshot for backup
 		try:
 			cmd = subprocess.check_output('rbd snap create {}{}@barque'.format(pool, vmdisk), shell=True)
@@ -128,6 +137,24 @@ class Worker(multiprocessing.Process):
 		#protect snapshot during backup
 		cmd = subprocess.check_output('rbd snap protect {}{}@barque'.format(pool, vmdisk), shell=True)
 
+		#check if poisoned 2
+		if r.hget(vmid, 'job') == 'poisoned':
+			try:
+				#unprotect barque snapshot
+				cmd = subprocess.check_output('rbd snap unprotect {}{}@barque'.format(pool, vmdisk), shell=True)
+				#delete barque snapshot
+				cmd = subprocess.check_output('rbd snap rm {}{}@barque'.format(pool, vmdisk), shell=True)
+				#delete stored config file
+				os.remove(config_dest)
+				r.hset(vmid, 'msg', 'Task successfully cancelled')
+				r.hset(vmid, 'state', 'OK')
+			except:
+				r.hset(vmid, 'state', 'error')
+				r.hset(vmid, 'msg', 'error removing backup snapshot while poisoned')
+				return
+			r.srem('joblock', vmid)
+			return
+
 		#create compressed backup file from backup snapshot
 		dest = "".join([destination, vmdisk, timestamp, ".lz4"])
 		args = ['rbd export --rbd-concurrent-management-ops 20 --export-format 2 {}{}@barque - | lz4 -1 - {}'.format(pool, vmdisk, dest)]
@@ -137,6 +164,26 @@ class Worker(multiprocessing.Process):
 		except:
 			r.hset(vmid, 'state', 'error')
 			r.hset(vmid, 'msg', 'unable to aquire rbd image for CTID: {}'.format(vmid))
+			return
+
+		#check poisoned 3
+		if r.hget(vmid, 'job') == 'poisoned':
+			try:
+				#remove backup file
+				os.remove(dest)
+				#unprotect barque snapshot
+				cmd = subprocess.check_output('rbd snap unprotect {}{}@barque'.format(pool, vmdisk), shell=True)
+				#delete barque snapshot
+				cmd = subprocess.check_output('rbd snap rm {}{}@barque'.format(pool, vmdisk), shell=True)
+				#delete stored config file
+				os.remove(config_dest)
+				r.hset(vmid, 'msg', 'Task successfully cancelled')
+				r.hset(vmid, 'state', 'OK')
+			except:
+				r.hset(vmid, 'state', 'error')
+				r.hset(vmid, 'msg', 'error cancelling backup, at poisoned 3')
+				return
+			r.srem('joblock', vmid)
 			return
 
 		#unprotect barque snapshot
@@ -162,16 +209,19 @@ class Worker(multiprocessing.Process):
 		fileconf = "".join([destination, filename, ".conf"])
 		
 		#find node hosting container
+		config_file = ""
 		config_target = "{}.conf".format(vmid)
 		for paths, dirs, files in os.walk('/etc/pve/nodes'):
 			if config_target in files:
 				config_file = os.path.join(paths, config_target)
+				print(config_file)
 				node = config_file.split('/')[4]
 				print(node)
-			else:
-				r.hset(vmid, 'state', 'error')
-				r.hset(vmid, 'msg', 'unable to locate container')
-		
+		if len(config_file) == 0:
+			r.hset(vmid, 'state', 'error')
+			r.hset(vmid, 'msg', 'unable to locate container')
+			return
+
 		#get storage info from running container
 		parserCurr = configparser.ConfigParser()
 		with open(config_file) as lines:
@@ -193,8 +243,16 @@ class Worker(multiprocessing.Process):
 		except:
 			r.hset(vmid, 'state', 'error')
 			r.hset(vmid, 'msg', 'unable to get storage info from backup config file')
+			return
+		#check if poisoned 1
+		if r.hget(vmid, 'job') == 'poisoned':
+			r.srem('joblock', vmid)
+			r.hset(vmid, 'msg', 'Task successfully cancelled')
+			r.hset(vmid, 'state', 'OK')
+			return
+
 		#stop container if not already stopped
-		r.hset(vmid, 'state', 'stopping container')
+		r.hset(vmid, 'msg', 'stopping container')
 		if not loads(subprocess.check_output("pvesh get /nodes/{}/lxc/{}/status/current".format(node, vmid), shell=True))["status"] == "stopped":
 			ctstop = subprocess.check_output("pvesh create /nodes/{}/lxc/{}/status/stop".format(node, vmid), shell=True)
 		timeout = time.time() + 60
@@ -204,15 +262,35 @@ class Worker(multiprocessing.Process):
 			if stat == "stopped":
 				break
 			elif time.time() > timeout:
-				return "timeout - unable to stop container", 500
+				r.hset(vmid, 'state', 'error')
+				r.hset(vmid, 'msg', 'Unable to stop container - timeout')
+				return
 		
 		#make recovery copy of container image
-		r.hset(vmid, 'state', 'creating disaster recovery image')
+		r.hset(vmid, 'msg', 'creating disaster recovery image')
 		imgcpy = subprocess.check_output("rbd cp --rbd-concurrent-management-ops 20 {}{} {}{}-barque".format(pool, 
 			vmdisk_current, pool, vmdisk_current), shell=True)
-		
+			
+		print("Waiting for poison test2")
+		time.sleep(15)	
+		#check if poisoned 2
+		if r.hget(vmid, 'job') == 'poisoned':
+			try:
+				#remove recovery copy
+				imgrm = subprocess.check_output("rbd rm {}{}-barque".format(pool, vmdisk_current), shell=True)
+				#un-stop container
+				ctstart = subprocess.check_output("pvesh create /nodes/{}/lxc/{}/status/start".format(node,vmid), shell=True)
+				r.hset(vmid, 'msg', 'Task successfully cancelled')
+				r.hset(vmid, 'state', 'OK')
+			except:
+				r.hset(vmid, 'msg', 'Error cancelling restore, at poisoned 2')
+				r.hset(vmid, 'state', 'error')
+				return
+			r.srem('joblock', vmid)
+			return
+
 		#delete container storage
-		r.hset(vmid, 'state', 'removing container image')
+		r.hset(vmid, 'msg', 'removing container image')
 		try:
 			imgdel = subprocess.check_output("pvesh delete /nodes/{}/storage/{}/content/{}:{}".format(node, storage_current, 
 				storage_current, vmdisk_current), shell=True)
@@ -236,10 +314,29 @@ class Worker(multiprocessing.Process):
 		#extract lz4 compressed image file
 		filetarget = "".join([destination, filename, ".img"])
 		uncompress = subprocess.check_output("lz4 -d {} {}".format(fileimg, filetarget), shell=True)
-		print(uncompress)
-		
+		print(uncompress)	
+		print("Waiting for poison test3")
+		time.sleep(15)	
+		#check if poisoned 3
+		if r.hget(vmid, 'job') == 'poisoned':
+			try:
+				#remove uncompressed image
+				os.remove(filetarget)
+				#try adding container image 
+				cmd = subprocess.check_output("rbd mv {}{}-barque {}{}".format(pool, vmdisk_current, pool, vmdisk_current), shell=True)
+				print(cmd)
+				ctstart = subprocess.check_output("pvesh create /nodes/{}/lxc/{}/status/start".format(node,vmid), shell=True)
+				r.hset(vmid, 'msg', 'Task successfully cancelled')
+				r.hset(vmid, 'state', 'OK')
+			except:
+				r.hset(vmid, 'msg', 'Error cancelling restore, at poisoned 3')
+				r.hset(vmid, 'state', 'error')
+				return
+			r.srem('joblock', vmid)
+			return
+
 		#import new image
-		r.hset(vmid, 'state', 'importing backup image')
+		r.hset(vmid, 'msg', 'importing backup image')
 		try:
 			rbdimp = subprocess.check_output("rbd import --rbd-concurrent-management-ops 20 --export-format 2 {} {}{}".format(filetarget, pool, vmdisk_final), shell=True)
 			print(rbdimp)
@@ -247,10 +344,11 @@ class Worker(multiprocessing.Process):
 			r.hset(vmid, 'state','error')
 			r.hset(vmid, 'msg', rbdimp)
 			cmd = subprocess.check_output("rbd mv {}{}-barque {}{}".format(pool, vmdisk_current, pool, vmdisk_current), shell=True)
+			os.remove(filetarget)
 			return
 		
 		#delete uncompressed image file
-		r.hset(vmid, 'state', 'cleaning up')
+		r.hset(vmid, 'msg', 'cleaning up')
 		rmuncomp = subprocess.check_output("rm {}".format(filetarget), shell=True)
 		print(rmuncomp)
 		
@@ -259,15 +357,34 @@ class Worker(multiprocessing.Process):
 		#image attenuation for kernel params #Removed after switching to format 2
 		# imgatten = subprocess.check_output("rbd feature disable {} object-map fast-diff deep-flatten".format(vmdisk), shell=True)
 		# print(imgatten)
-		
+	
+		print("Waiting for poison test4")
+		time.sleep(15)	
+		#check if poisoned 4
+		if r.hget(vmid, 'job') == 'poisoned':
+			try:
+				#try removing the recovered image
+				cmd = subprocess.check_output("rbd rm {}{}".format(pool, vmdisk_current), shell=True)
+				#try adding container image 
+				cmd = subprocess.check_output("rbd mv {}{}-barque {}{}".format(pool, vmdisk_current, pool, vmdisk_current), shell=True)
+				print(cmd)
+				ctstart = subprocess.check_output("pvesh create /nodes/{}/lxc/{}/status/start".format(node,vmid), shell=True)
+				r.hset(vmid, 'msg', 'Task successfully cancelled')
+				r.hset(vmid, 'state', 'OK')
+			except:
+				r.hset(vmid, 'msg', 'Error cancelling restore, at poisoned 4')
+				r.hset(vmid, 'state', 'error')
+				return
+			r.srem('joblock', vmid)
+			return
 		#replace config file
 		copyfile(fileconf, config_file)
 		
 		#start container
 		ctstart = subprocess.check_output("pvesh create /nodes/{}/lxc/{}/status/start".format(node,vmid), shell=True)
-		time.sleep(5)
+		#time.sleep(5)
 		print(ctstart)
-		
+
 		#cleanup recovery copy
 		cmd = subprocess.check_output("rbd rm {}{}-barque".format(pool, vmdisk_current), shell=True)
 		r.hset(vmid, 'state','OK')
@@ -320,7 +437,11 @@ class Worker(multiprocessing.Process):
 		# 	r.hset(vmid, 'job', 'backup')
 		# 	r.hset(vmid, 'state', 'enqueued')
 		return
-
+	def poison(self, vmid):
+		r.srem('joblock', vmid)
+		r.hset(vmid, 'state', 'OK')
+		r.hset(vmid, 'msg', 'Task successfully cancelled')
+		return
 	def migrate(self, vmid):
 		pass
 
@@ -354,15 +475,7 @@ class Backup(Resource):
 			r.sadd('joblock', vmid)
 
 		return {'status': "backup job created for CTID {}".format(vmid)}, 202
-def checkDest(dest):
-	if dest in locations:
-		directory = locations[dest]
-		if os.path.exists(directory):
-			return True, None, None
-		else:
-			return False, {'error':'{} is not currently accessible'.format(directory)}, 500
-	else:
-		return False, {'error':'{} is not a configured destination'.format(dest)}, 400
+
 class BackupAll(Resource):
 	@auth.login_required
 	def post(self):
@@ -543,6 +656,18 @@ class CleanSnaps(Resource):
 				# 	r.hset(vmid, 'retry', 'backup')
 				r.hset(vmid, 'job', 'scrub')
 				r.hset(vmid, 'state', 'enqueued')
+class Poison(Resource):
+	@auth.login_required
+	def post(self, vmid):
+		#catch if container does not exist
+		if str(vmid) in r.smembers('joblock'):
+			r.hset(vmid, 'job', 'poisoned')
+			if r.hget(vmid, 'state') == 'error':
+				r.hset(vmid, 'state', 'enqueued')
+			return {'status':"Attempting to cancel task or error for container: {}".format(vmid)}, 200
+		else:
+			return {'status':"Container not in job queue, nothing to do"}, 200
+
 
 api.add_resource(ListAllBackups, '/barque/')
 api.add_resource(ListBackups, '/barque/<int:vmid>')
@@ -554,6 +679,7 @@ api.add_resource(Status, '/barque/<int:vmid>/status')
 api.add_resource(AllStatus, '/barque/all/status')
 api.add_resource(ClearQueue, '/barque/all/clear')
 api.add_resource(CleanSnaps, '/barque/all/clean')
+api.add_resource(Poison, '/barque/<int:vmid>/poison')
 
 def sanitize():
 	for item in r.smembers('joblock'):
@@ -569,6 +695,7 @@ def verify(username, password):
 
 def checkConf(vmid):
 	#catch if container does not exist
+	config_file = ""
 	config_target = "{}.conf".format(vmid)
 	for paths, dirs, files in os.walk('/etc/pve/nodes'):
 		if config_target in files:
@@ -579,6 +706,16 @@ def checkConf(vmid):
 		r.hset(vmid, 'msg', '{} is invalid CTID'.format(vmid))
 		return False
 	return True
+
+def checkDest(dest):
+	if dest in locations:
+		directory = locations[dest]
+		if os.path.exists(directory):
+			return True, None, None
+		else:
+			return False, {'error':'{} is not currently accessible'.format(directory)}, 500
+	else:
+		return False, {'error':'{} is not a configured destination'.format(dest)}, 400
 
 if __name__ == '__main__':
 	r = redis.Redis(host=r_host, port=r_port, password=r_pw)
