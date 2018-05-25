@@ -271,8 +271,8 @@ class Worker(multiprocessing.Process):
 		imgcpy = subprocess.check_output("rbd cp --rbd-concurrent-management-ops 20 {}{} {}{}-barque".format(pool, 
 			vmdisk_current, pool, vmdisk_current), shell=True)
 			
-		print("Waiting for poison test2")
-		time.sleep(15)	
+		# print("Waiting for poison test2")
+		# time.sleep(15)	
 		#check if poisoned 2
 		if r.hget(vmid, 'job') == 'poisoned':
 			try:
@@ -315,8 +315,9 @@ class Worker(multiprocessing.Process):
 		filetarget = "".join([destination, filename, ".img"])
 		uncompress = subprocess.check_output("lz4 -d {} {}".format(fileimg, filetarget), shell=True)
 		print(uncompress)	
-		print("Waiting for poison test3")
-		time.sleep(15)	
+		
+		# print("Waiting for poison test3")
+		# time.sleep(15)	
 		#check if poisoned 3
 		if r.hget(vmid, 'job') == 'poisoned':
 			try:
@@ -358,8 +359,8 @@ class Worker(multiprocessing.Process):
 		# imgatten = subprocess.check_output("rbd feature disable {} object-map fast-diff deep-flatten".format(vmdisk), shell=True)
 		# print(imgatten)
 	
-		print("Waiting for poison test4")
-		time.sleep(15)	
+		# print("Waiting for poison test4")
+		# time.sleep(15)	
 		#check if poisoned 4
 		if r.hget(vmid, 'job') == 'poisoned':
 			try:
