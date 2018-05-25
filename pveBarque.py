@@ -315,7 +315,7 @@ class Worker(multiprocessing.Process):
 		filetarget = "".join([destination, filename, ".img"])
 		uncompress = subprocess.check_output("lz4 -d {} {}".format(fileimg, filetarget), shell=True)
 		print(uncompress)	
-		
+
 		# print("Waiting for poison test3")
 		# time.sleep(15)	
 		#check if poisoned 3
@@ -422,6 +422,7 @@ class Worker(multiprocessing.Process):
 			#snapshot successfully removed, set OK
 			r.hset(vmid, 'state', 'OK')
 			r.hset(vmid, 'msg', 'snapshot successfully scrubbed - removed only')
+			r.srem('joblock', vmid)
 			return
 		#snapshot successfully unprotected, attempt removal
 		try:
@@ -433,6 +434,7 @@ class Worker(multiprocessing.Process):
 		#snapshot successfully removed, set OK
 		r.hset(vmid, 'state', 'OK')
 		r.hset(vmid, 'msg', 'snapshot successfully scrubbed - unprotected and removed')
+		r.srem('joblock', vmid)
 		retry = r.hget(vmid, 'retry')
 		# if retry == 'backup': #REMOVE - used for testing snap scrubbing
 		# 	r.hset(vmid, 'job', 'backup')
@@ -482,6 +484,16 @@ class BackupAll(Resource):
 	def post(self):
 		targets = []
 		response = []
+		dest = ""
+		#handle destination setting
+		if 'dest' in request.args:
+			result, response, err = checkDest(request.args['dest'])
+			if result:
+				dest = locations[request.args['dest']]
+			else:
+				return response, err
+		else:
+			dest = locations[locations.keys()[0]]
 		for paths, dirs, files in os.walk('/etc/pve/nodes'):
 			for f in files:
 				if f.endswith(".conf"):
@@ -495,6 +507,7 @@ class BackupAll(Resource):
 				r.hset(vmid, 'worker', '')
 				r.hset(vmid, 'msg', '')
 				r.hset(vmid, 'state', 'enqueued')
+				r.hset(vmid, 'dest', dest)
 				r.sadd('joblock', vmid)
 				response.append({vmid: {"status":"enqueued", "message":"Backup job added to queue"}})
 		return response
