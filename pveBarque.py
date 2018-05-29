@@ -606,8 +606,17 @@ class ListBackups(Resource):
 class DeleteBackup(Resource):
 	@auth.login_required
 	def post(self,vmid):
+		path = None
 		if str(vmid) in r.smembers('joblock'):
 			return {'error': 'CTID locked, another operation is in progress for container {}'.format(vmid)}, 409
+		if 'dest' in request.args:
+			result, response, err = checkDest(request.args['dest'])
+			if result:
+				path = locations[request.args['dest']]
+			else:
+				return response, err
+		else:
+			path = locations[locations.keys()[0]]
 		if 'file' in request.args:
 			if not request.args['file'].split('-')[1] == str(vmid):
 				return {'error': 'File name does not match VMID'}, 400
@@ -666,6 +675,8 @@ class ClearQueue(Resource):
 				response.append({vmid: {"status":"OK", "message":"Successfully dequeued"}})
 			else:
 				msg = r.hget(vmid, 'msg')
+				job = r.hget(vmid, 'job')
+				file = r.hget(vmid, 'file')
 				response.append({vmid: {'status':status, 'message':msg, 'job':job, 'file': file}})
 		return response
 
