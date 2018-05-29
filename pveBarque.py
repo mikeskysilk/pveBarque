@@ -103,9 +103,14 @@ class Worker(multiprocessing.Process):
 		print("config exists within worker process? {}".format(valid))
 		#get storage info from config file
 		parser = configparser.ConfigParser()
-		with open(config_file) as lines:
-			lines = itertools.chain(("[root]",), lines)
-			parser.read_file(lines)
+		try:
+			with open(config_file) as lines:
+				lines = itertools.chain(("[root]",), lines)
+				parser.read_file(lines)
+		except:
+			r.hset(vmid, 'state', 'error')
+			r.hset(vmid, 'msg', 'unable to open config file')
+			return
 		try:
 			storage, vmdisk = parser['root']['rootfs'].split(',')[0].split(':')
 		except:
@@ -132,8 +137,12 @@ class Worker(multiprocessing.Process):
 
 		#copy config file
 		config_dest = "".join([destination, vmdisk, timestamp, ".conf"])
-		copyfile(config_file, config_dest)
-
+		try:
+			copyfile(config_file, config_dest)
+		except:
+			r.hset(vmid, 'msg', 'unable to copy config file')
+			r.hset(vmid, 'state', 'error')
+			return
 		#protect snapshot during backup
 		cmd = subprocess.check_output('rbd snap protect {}{}@barque'.format(pool, vmdisk), shell=True)
 
@@ -158,12 +167,16 @@ class Worker(multiprocessing.Process):
 		#create compressed backup file from backup snapshot
 		dest = "".join([destination, vmdisk, timestamp, ".lz4"])
 		args = ['rbd export --rbd-concurrent-management-ops 20 --export-format 2 {}{}@barque - | lz4 -1 - {}'.format(pool, vmdisk, dest)]
-		r.hset(vmid, 'state', 'Creating backup image')
+		r.hset(vmid, 'msg', 'Creating backup image')
 		try:
 			cmd = subprocess.check_output(args, shell=True)#.split('\n') #run command then convert output to list, splitting on newline
 		except:
 			r.hset(vmid, 'state', 'error')
 			r.hset(vmid, 'msg', 'unable to aquire rbd image for CTID: {}'.format(vmid))
+			#unprotect barque snapshot
+			cmd = subprocess.check_output('rbd snap unprotect {}{}@barque'.format(pool, vmdisk), shell=True)
+			#delete barque snapshot
+			cmd = subprocess.check_output('rbd snap rm {}{}@barque'.format(pool, vmdisk), shell=True)
 			return
 
 		#check poisoned 3
@@ -596,7 +609,7 @@ class DeleteBackup(Resource):
 		if str(vmid) in r.smembers('joblock'):
 			return {'error': 'CTID locked, another operation is in progress for container {}'.format(vmid)}, 409
 		if 'file' in request.args:
-			if request.args['file'].split('-')[1] is not str(vmid):
+			if not filename.split('-')[1] == str(vmid):
 				return {'error': 'File name does not match VMID'}, 400
 			r.sadd('joblock', vmid)
 			print(request.args['file'])
