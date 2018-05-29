@@ -26,7 +26,7 @@ r_pw = config['redis']['password']				#Redis server password
 locations = {}									#backup storage destinations
 for option in config.options('destinations'):
 	locations[option] = config.get('destinations', option)
-
+__version = 0.79
 
 #global vars
 app = Flask(__name__)
@@ -609,7 +609,7 @@ class DeleteBackup(Resource):
 		if str(vmid) in r.smembers('joblock'):
 			return {'error': 'CTID locked, another operation is in progress for container {}'.format(vmid)}, 409
 		if 'file' in request.args:
-			if not filename.split('-')[1] == str(vmid):
+			if not request.args['file'].split('-')[1] == str(vmid):
 				return {'error': 'File name does not match VMID'}, 400
 			r.sadd('joblock', vmid)
 			print(request.args['file'])
