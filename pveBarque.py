@@ -738,11 +738,7 @@ class Info(Resource):
 		now = datetime.utcnow().replace(microsecond=0)
 		uptime = now - starttime
 		response['uptime'] = str(uptime)
-		workerStatus = {}
-		for worker in workers:
-			healthy = "Alive" if worker.is_alive() else "Dead"
-			workerStatus[worker.name] = healthy
-		response['workers'] = workerStatus
+		workerTask = {}
 		#queue status
 		setSize = r.scard('joblock')
 		active = 0
@@ -750,9 +746,23 @@ class Info(Resource):
 		for member in r.smembers('joblock'):
 			if r.hget(member, 'state') == "active":
 				active += 1
+				workerTask[r.hget(member, 'worker')] = {'1': r.hget(member,'job'), '2':r.hget(member, 'msg'), '3':member}
 			if r.hget(member, 'state') == "error":
 				errors += 1
 		response['Queue'] = {'jobs in queue':setSize, 'active': active, 'errors':errors}
+		#worker status
+		workerStatus = {}
+		print(workerTask.keys())
+		for worker in workers:
+			healthy = "Alive" if worker.is_alive() else "Dead"
+			try: task = workerTask[str(worker.pid)][1]
+			except: task = ""
+			try: message = workerTask[str(worker.pid)][2]
+			except: message = ""
+			try: container = workerTask[str(worker.pid)][3]
+			except: container = ""
+			workerStatus[worker.name] = {'Health':healthy, 'Job': task, 'Message': message, 'CTID': container}
+		response['workers'] = workerStatus
 		#destination status
 		dests = {}
 		for spot in locations.keys():
