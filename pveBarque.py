@@ -26,7 +26,8 @@ r_pw = config['redis']['password']				#Redis server password
 locations = {}									#backup storage destinations
 for option in config.options('destinations'):
 	locations[option] = config.get('destinations', option)
-__version = 0.79
+version = '0.79b'
+starttime = None
 
 #global vars
 app = Flask(__name__)
@@ -69,6 +70,8 @@ class Worker(multiprocessing.Process):
 		 					self.migrate(job)
 		 				elif task == 'poisoned':
 		 					self.poison(job)
+		 				elif task == 'deepscrub':
+		 					self.scrubDeep()
 		 				else:
 		 					print("{} unable to determine task...".format(name))
 		 			else:
@@ -453,6 +456,20 @@ class Worker(multiprocessing.Process):
 		# 	r.hset(vmid, 'job', 'backup')
 		# 	r.hset(vmid, 'state', 'enqueued')
 		return
+	def scrubDeep(self):
+		out = subprocess.check_output('rbd ls', shell=True)
+		for disk in out.split():
+			cmd = subprocess.check_output('rbd snap ls {}'.format(disk), shell=True)
+			if "barque" in cmd.split():
+				vmid = disk.split('-')[1]
+				if not r.hget(vmid, 'state') == 'active':
+					r.hset(vmid, 'job', 'scrub')
+					r.hset(vmid, 'state','enqueued')
+					print('snap found on {}, adding to queue'.format(disk))
+			else:
+				print("{} clean, moving on".format(disk))
+		r.srem('joblock', 0)
+
 	def poison(self, vmid):
 		r.srem('joblock', vmid)
 		r.hset(vmid, 'state', 'OK')
@@ -570,6 +587,7 @@ class ListAllBackups(Resource):
 	@auth.login_required
 	def get(self):
 		path = None
+
 		#handle destination setting
 		if 'dest' in request.args:
 			result, response, err = checkDest(request.args['dest'])
@@ -579,15 +597,15 @@ class ListAllBackups(Resource):
 				return response, err
 		else:
 			path = locations[locations.keys()[-1]]
-		result = []
+		images = []
 		confs = []
 		for paths, dirs, files in os.walk(path):
 			for f in files:
 				if f.endswith('.lz4'):
-					result.append(f)
+					images.append(f)
 				elif f.endswith('.conf'):
 					confs.append(f)
-		return {'backup files': result, 'config files': confs}
+		return {'backup files': images, 'config files': confs}
 
 class ListBackups(Resource):
 	@auth.login_required
@@ -684,6 +702,11 @@ class CleanSnaps(Resource):
 	@auth.login_required
 	def post(self):
 		response = []
+		if 'deep' in request.args:
+			r.hset(0, 'job', 'deepscrub')
+			r.hset(0, 'state', 'enqueued')
+			r.sadd('joblock', 0)
+			return{'Status':"Deep scrub in progress"}, 200
 		for vmid in r.smembers('joblock'):
 			status = r.hget(vmid, 'state')
 			msg = r.hget(vmid, 'msg')
@@ -694,6 +717,7 @@ class CleanSnaps(Resource):
 				# 	r.hset(vmid, 'retry', 'backup')
 				r.hset(vmid, 'job', 'scrub')
 				r.hset(vmid, 'state', 'enqueued')
+
 class Poison(Resource):
 	@auth.login_required
 	def post(self, vmid):
@@ -706,6 +730,37 @@ class Poison(Resource):
 		else:
 			return {'status':"Container not in job queue, nothing to do"}, 200
 
+class Info(Resource):
+	@auth.login_required
+	def get(self):
+		response = {}
+		response['version'] = version
+		now = datetime.utcnow().replace(microsecond=0)
+		uptime = now - starttime
+		response['uptime'] = str(uptime)
+		workerStatus = {}
+		for worker in workers:
+			healthy = "Alive" if worker.is_alive() else "Dead"
+			workerStatus[worker.name] = healthy
+		response['workers'] = workerStatus
+		#queue status
+		setSize = r.scard('joblock')
+		active = 0
+		errors = 0
+		for member in r.smembers('joblock'):
+			if r.hget(member, 'state') == "active":
+				active += 1
+			if r.hget(member, 'state') == "error":
+				errors += 1
+		response['Queue'] = {'jobs in queue':setSize, 'active': active, 'errors':errors}
+		#destination status
+		dests = {}
+		for spot in locations.keys():
+			healthy = "OK" if os.path.isdir(locations[spot]) else "DOWN"
+			dests[spot] = healthy
+		response['Storage'] = dests
+		return response
+
 
 api.add_resource(ListAllBackups, '/barque/')
 api.add_resource(ListBackups, '/barque/<int:vmid>')
@@ -715,6 +770,7 @@ api.add_resource(Restore, '/barque/<int:vmid>/restore')
 api.add_resource(DeleteBackup, '/barque/<int:vmid>/delete')
 api.add_resource(Status, '/barque/<int:vmid>/status')
 api.add_resource(AllStatus, '/barque/all/status')
+api.add_resource(Info, '/barque/info')
 api.add_resource(ClearQueue, '/barque/all/clear')
 api.add_resource(CleanSnaps, '/barque/all/clean')
 api.add_resource(Poison, '/barque/<int:vmid>/poison')
@@ -756,6 +812,7 @@ def checkDest(dest):
 		return False, {'error':'{} is not a configured destination'.format(dest)}, 400
 
 if __name__ == '__main__':
+	starttime = datetime.utcnow().replace(microsecond=0)
 	r = redis.Redis(host=r_host, port=r_port, password=r_pw)
 	sanitize()
 	print("redis connection successful")
@@ -764,4 +821,4 @@ if __name__ == '__main__':
 		workers.append(p)
 		p.start()
 		print("worker started")
-	app.run(host=__host,port=__port, debug=True, ssl_context=(cert, key))
+	app.run(host=__host,port=__port, debug=True, ssl_context=(cert, key), use_reloader=False)
