@@ -770,8 +770,48 @@ class Info(Resource):
 			dests[spot] = healthy
 		response['Storage'] = dests
 		return response
-
-
+class AVtoggle(Resource):
+	@auth.login_required
+	def post(self):
+		if 'node' not in request.args:
+			return {'error': 'Node argument required beacuse... it needs a node'}, 400
+		# if 'ctid' not in request.args:
+		# 	return {'error': 'Container ID required for locking'}, 400
+		if 'switch' in request.args:
+			if request.args['switch'] == 'off':
+				node = request.args['node']
+				try:
+					print("node: {}".format(node))
+					cmd= subprocess.check_output("ssh -t root@{} '/opt/sophos-av/bin/savdctl disable'".format(node), shell=True)
+					print("disabling antivirus on node: {}, output: {}".format(node, cmd))
+				except:
+					return{'state':'error'},200
+				return {'state':'disabled'},200
+			if request.args['switch'] == 'on':
+				node = request.args['node']
+				try:
+					print("node: {}".format(node))
+					cmd= subprocess.check_output("ssh -t root@{} '/opt/sophos-av/bin/savdctl enable'".format(node),shell=True)
+					print("enabling antivirus on node: {}, output: {}".format(node, cmd))
+				except:
+					return{'state':'error'},200
+				return {'state':'enabling'}
+		else:
+			return {'error':'switch not specified, should be "on" or "off"'},400
+	def get(self):
+		if 'node' not in request.args:
+			return {'error': 'Node argument required beacuse... it needs a node'}, 400
+		node = request.args['node']
+		try:
+			print("node: {}".format(node))
+			cmd= subprocess.check_output("ssh -t root@{} '/opt/sophos-av/bin/savdstatus'".format(node), shell=True)
+			return{'status':cmd.strip()},200
+		except subprocess.CalledProcessError as e:
+			return {'status':e.output.strip()},200
+		except:
+			print("error getting status")
+			return{'error':'problem getting status'},200
+			
 api.add_resource(ListAllBackups, '/barque/')
 api.add_resource(ListBackups, '/barque/<int:vmid>')
 api.add_resource(Backup, '/barque/<int:vmid>/backup')
@@ -784,6 +824,7 @@ api.add_resource(Info, '/barque/info')
 api.add_resource(ClearQueue, '/barque/all/clear')
 api.add_resource(CleanSnaps, '/barque/all/clean')
 api.add_resource(Poison, '/barque/<int:vmid>/poison')
+api.add_resource(AVtoggle, '/barque/avtoggle')
 
 def sanitize():
 	for item in r.smembers('joblock'):
