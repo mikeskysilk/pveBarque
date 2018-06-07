@@ -1,3 +1,4 @@
+#!/usr/bin/python2.7
 from flask import Flask, request
 from flask_restful import Resource, Api, reqparse, abort
 from json import dumps, loads
@@ -26,7 +27,7 @@ r_pw = config['redis']['password']				#Redis server password
 locations = {}									#backup storage destinations
 for option in config.options('destinations'):
 	locations[option] = config.get('destinations', option)
-version = '0.79d'
+version = '0.79e'
 starttime = None
 
 #global vars
@@ -42,50 +43,59 @@ parser.add_argument('file','vmid')
 class Worker(multiprocessing.Process):
 	r = None
 	def run(self):
-	 	licensed_to_live = True
-	 	my = multiprocessing.current_process()
-	 	name = 'Process {}'.format(my.pid)
-	 	print("{} started".format(name))
-	 	r = redis.Redis(host=r_host, port=r_port, password=r_pw)
-	 	print("{} connected to redis".format(name))
-	# 	#block for items in joblock
+		licensed_to_live = True
+		my = multiprocessing.current_process()
+		name = 'Process {}'.format(my.pid)
+		print("{} started".format(name))
+		r = redis.Redis(host=r_host, port=r_port, password=r_pw)
+		print("{} connected to redis".format(name))
+#		#block for items in joblock
 		while licensed_to_live:
-		 	for job in r.smembers('joblock'):
-		 		if r.hget(job, 'state') == 'enqueued':
-		 			r.hset(job, 'state', 'locked')
-		 			r.hset(job, 'worker', str(my.pid))
-		 			print("{} attempting to lock {}".format(name, job))
-		 			time.sleep(0.5)
-		 			#check if lock belongs to this worker
-		 			if r.hget(job, 'worker') == str(my.pid):
-		 				print("{} lock successful, proceeding".format(name))
-		 				task = r.hget(job, 'job')
-		 				if task == 'backup':
-		 					self.backup(job)
-		 				elif task == 'restore':
-		 					self.restore(job)
-		 				elif task == 'scrub':
-		 					self.scrubSnaps(job)
-		 				elif task == 'import':
-		 					self.migrate(job)
-		 				elif task == 'poisoned':
-		 					self.poison(job)
-		 				elif task == 'deepscrub':
-		 					self.scrubDeep()
-		 				else:
-		 					print("{} unable to determine task...".format(name))
-		 			else:
-		 				print("{} lock unsuccessful, reentering queue".format(name))
-		 		#be nice to redis
-		 		time.sleep(0.1)
-		 	time.sleep(5)
-		 	#licensed_to_live = False
-	 	return
+			for job in r.smembers('joblock'):
+				if r.hget(job, 'state') == 'enqueued':
+					r.hset(job, 'state', 'locked')
+					r.hset(job, 'worker', str(my.pid))
+					print("{} attempting to lock {}".format(name, job))
+					time.sleep(0.5)
+					#check if lock belongs to this worker
+					if r.hget(job, 'worker') == str(my.pid):
+						print("{} lock successful, proceeding".format(name))
+						task = r.hget(job, 'job')
+						if task == 'backup':
+							self.backup(job)
+						elif task == 'restore':
+							self.restore(job)
+						elif task == 'scrub':
+							self.scrubSnaps(job)
+						elif task == 'import':
+							self.migrate(job)
+						elif task == 'poisoned':
+							self.poison(job)
+						elif task == 'deepscrub':
+							self.scrubDeep()
+						else:
+							print("{} unable to determine task...".format(name))
+					else:
+						print("{} lock unsuccessful, reentering queue".format(name))
+				#be nice to redis
+				time.sleep(0.1)
+			time.sleep(5)
+			#licensed_to_live = False
+		return
 
 	def backup(self,vmid):
 		storage = None
 		vmdisk = None
 		destination = r.hget(vmid, 'dest')
+		destHealth = checkDest(destination)
+		if not destHealth:
+			cmd = subprocess.check_output('/bin/bash /etc/pve/utilities/detect_stale.sh', shell=True)
+			print(cmd)
+			destHealth = checkDest(destination)
+			if not destHealth:
+				r.hset(vmid, 'msg','{} storage destination is offline, unable to recover')
+				r.hset(vmid, 'state', 'error')
+				return
 		r.hset(vmid, 'state','active')
 		#vmdisk = 'vm-{}-disk-1'.format(vmid)
 		timestamp = datetime.strftime(datetime.utcnow(),"_%Y-%m-%d_%H-%M-%S")
@@ -143,6 +153,8 @@ class Worker(multiprocessing.Process):
 		try:
 			copyfile(config_file, config_dest)
 		except:
+			#delete barque snapshot
+			cmd = subprocess.check_output('rbd snap rm {}{}@barque'.format(pool, vmdisk), shell=True)
 			r.hset(vmid, 'msg', 'unable to copy config file')
 			r.hset(vmid, 'state', 'error')
 			return
@@ -217,6 +229,15 @@ class Worker(multiprocessing.Process):
 		config_file = ""
 		node = ""
 		destination = r.hget(vmid, 'dest')
+		destHealth = checkDest(destination)
+		if not destHealth:
+			cmd = subprocess.check_output('/bin/bash /etc/pve/utilities/detect_stale.sh', shell=True)
+			print(cmd)
+			destHealth = checkDest(destination)
+			if not destHealth:
+				r.hset(vmid, 'msg','{} storage destination is offline, unable to recover')
+				r.hset(vmid, 'state', 'error')
+				return
 		filename = r.hget(vmid, 'file')
 		r.hset(vmid, 'state', 'active')
 
@@ -457,6 +478,7 @@ class Worker(multiprocessing.Process):
 		# 	r.hset(vmid, 'state', 'enqueued')
 		return
 	def scrubDeep(self):
+		r.hset('0', 'state', 'active')
 		out = subprocess.check_output('rbd ls {}'.format(pool.strip('/')), shell=True)
 		for disk in out.split():
 			cmd = subprocess.check_output('rbd snap ls {}{}'.format(pool,disk), shell=True)
@@ -465,6 +487,7 @@ class Worker(multiprocessing.Process):
 				if not r.hget(vmid, 'state') == 'active':
 					r.hset(vmid, 'job', 'scrub')
 					r.hset(vmid, 'state','enqueued')
+					r.sadd('joblock', vmid)
 					print('snap found on {}, adding to queue'.format(disk))
 			else:
 				print("{} clean, moving on".format(disk))
@@ -485,6 +508,7 @@ class Worker(multiprocessing.Process):
 class Backup(Resource):
 	@auth.login_required
 	def post(self, vmid):
+		dest = ""
 		#catch if container does not exist
 		if not checkConf(vmid):
 			return {'error':"{} is not a valid CTID"}, 400
@@ -495,11 +519,15 @@ class Backup(Resource):
 		if 'dest' in request.args:
 			result, response, err = checkDest(request.args['dest'])
 			if result:
-				r.hset(vmid, 'dest', locations[request.args['dest']])
+				dest = locations[request.args['dest']]
 			else:
 				return response, err
 		else:
-			r.hset(vmid, 'dest', locations[locations.keys()[0]])
+			result, response, err = checkDest(locations.keys()[-1])
+			if result:
+				dest = locations[locations.keys()[-1]]
+			else:
+				return response, err
 		if str(vmid) in r.smembers('joblock'):
 			return {'error':"VMID locked, another operation is in progress for container: {}".format(vmid), 
 				'status': r.hget(vmid,'state'),'job':r.hget(vmid, 'job')}, 409
@@ -509,6 +537,7 @@ class Backup(Resource):
 			r.hset(vmid, 'worker', '')
 			r.hset(vmid, 'msg', '')
 			r.hset(vmid, 'state', 'enqueued')
+			r.hset(vmid, 'dest', dest)
 			r.sadd('joblock', vmid)
 
 		return {'status': "backup job created for CTID {}".format(vmid)}, 202
@@ -517,7 +546,6 @@ class BackupAll(Resource):
 	@auth.login_required
 	def post(self):
 		targets = []
-		response = []
 		dest = ""
 		#handle destination setting
 		if 'dest' in request.args:
@@ -527,7 +555,12 @@ class BackupAll(Resource):
 			else:
 				return response, err
 		else:
-			dest = locations[locations.keys()[0]]
+			result, response, err = checkDest(locations.keys()[-1])
+			if result:
+				dest = locations[locations.keys()[-1]]
+			else:
+				return response, err
+		response = []
 		for paths, dirs, files in os.walk('/etc/pve/nodes'):
 			for f in files:
 				if f.endswith(".conf"):
@@ -558,7 +591,11 @@ class Restore(Resource):
 			else:
 				return response, err
 		else:
-			path = locations[locations.keys()[-1]]
+			result, response, err = checkDest(locations.keys()[-1])
+			if result:
+				path = locations[locations.keys()[-1]]
+			else:
+				return response, err
 		#check if file specified
 		if 'file' not in request.args:
 			return {'error': 'Resource requires a file argument'}, 400
@@ -600,7 +637,11 @@ class ListAllBackups(Resource):
 			else:
 				return response, err
 		else:
-			path = locations[locations.keys()[-1]]
+			result, response, err = checkDest(locations.keys()[-1])
+			if result:
+				path = locations[locations.keys()[-1]]
+			else:
+				return response, err
 		images = []
 		confs = []
 		for paths, dirs, files in os.walk(path):
@@ -622,7 +663,11 @@ class ListBackups(Resource):
 			else:
 				return response, err
 		else:
-			path = locations[locations.keys()[-1]]
+			result, response, err = checkDest(locations.keys()[-1])
+			if result:
+				path = locations[locations.keys()[-1]]
+			else:
+				return response, err
 		files = sorted(os.path.basename(f) for f in glob("".join([path, "vm-{}-disk*.lz4".format(vmid)])))
 		return {'backups': files}
 class DeleteBackup(Resource):
@@ -638,7 +683,11 @@ class DeleteBackup(Resource):
 			else:
 				return response, err
 		else:
-			path = locations[locations.keys()[0]]
+			result, response, err = checkDest(locations.keys()[-1])
+			if result:
+				path = locations[locations.keys()[-1]]
+			else:
+				return response, err
 		if 'file' in request.args:
 			if not request.args['file'].split('-')[1] == str(vmid):
 				return {'error': 'File name does not match VMID'}, 400
@@ -738,6 +787,7 @@ class Info(Resource):
 	@auth.login_required
 	def get(self):
 		response = {}
+		barqueHealth = 'OK'
 		response['version'] = version
 		now = datetime.utcnow().replace(microsecond=0)
 		uptime = now - starttime
@@ -753,26 +803,43 @@ class Info(Resource):
 				workerTask[r.hget(member, 'worker')] = {'1': r.hget(member,'job'), '2':r.hget(member, 'msg'), '3':member}
 			if r.hget(member, 'state') == "error":
 				errors += 1
+				if not barqueHealth == 'CRITICAL':
+					barqueHealth = 'WARNING'
 		response['Queue'] = {'jobs in queue':setSize, 'active': active, 'errors':errors}
 		#worker status
 		workerStatus = {}
 		print(workerTask.keys())
 		for worker in workers:
-			healthy = "Alive" if worker.is_alive() else "Dead"
-			try: task = workerTask[str(worker.pid)][1]
-			except: task = ""
-			try: message = workerTask[str(worker.pid)][2]
-			except: message = ""
-			try: container = workerTask[str(worker.pid)][3]
-			except: container = ""
+			if worker.is_alive():
+				healthy = "Alive" 
+			else:
+				healthy = "Dead"
+				barqueHealth = 'CRITICAL'
+			try: 
+				task = workerTask[str(worker.pid)][1]
+			except: 
+				task = ""
+			try: 
+				message = workerTask[str(worker.pid)][2]
+			except: 
+				message = ""
+			try: 
+				container = workerTask[str(worker.pid)][3]
+			except: 
+				container = ""
 			workerStatus[worker.name] = {'Health':healthy, 'Job': task, 'Message': message, 'CTID': container}
 		response['workers'] = workerStatus
 		#destination status
 		dests = {}
 		for spot in locations.keys():
-			healthy = "OK" if os.path.isdir(locations[spot]) else "DOWN"
+			if os.path.isdir(locations[spot]):
+				healthy = "OK"
+			else:
+				healthy = "Down"
+				barqueHealth = 'CRITICAL'
 			dests[spot] = healthy
 		response['Storage'] = dests
+		response['Health'] = barqueHealth
 		return response
 class AVtoggle(Resource):
 	@auth.login_required
@@ -802,6 +869,7 @@ class AVtoggle(Resource):
 				return {'state':'enabling'}
 		else:
 			return {'error':'switch not specified, should be "on" or "off"'},400
+	@auth.login_required
 	def get(self):
 		if 'node' not in request.args:
 			return {'error': 'Node argument required beacuse... it needs a node'}, 400
@@ -869,7 +937,11 @@ def checkDest(dest):
 		if os.path.exists(directory):
 			return True, None, None
 		else:
-			return False, {'error':'{} is not currently accessible'.format(directory)}, 500
+			cmd = subprocess.check_output('/bin/bash /etc/pve/utilities/detect_stale.sh', shell=True)
+			if os.path.exists(directory):
+				return True, None, None
+			else:
+				return False, {'error':'{} is not currently accessible'.format(directory)}, 500
 	else:
 		return False, {'error':'{} is not a configured destination'.format(dest)}, 400
 
