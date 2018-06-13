@@ -27,7 +27,7 @@ r_pw = config['redis']['password']				#Redis server password
 locations = {}									#backup storage destinations
 for option in config.options('destinations'):
 	locations[option] = config.get('destinations', option)
-version = '0.79e'
+version = '0.79f'
 starttime = None
 
 #global vars
@@ -849,24 +849,36 @@ class AVtoggle(Resource):
 		# if 'ctid' not in request.args:
 		# 	return {'error': 'Container ID required for locking'}, 400
 		if 'switch' in request.args:
-			if request.args['switch'] == 'off':
-				node = request.args['node']
-				try:
-					print("node: {}".format(node))
-					cmd= subprocess.check_output("ssh -t root@{} '/opt/sophos-av/bin/savdctl disable'".format(node), shell=True)
-					print("disabling antivirus on node: {}, output: {}".format(node, cmd))
-				except:
-					return{'state':'error'},200
-				return {'state':'disabling'},200
-			if request.args['switch'] == 'on':
-				node = request.args['node']
-				try:
-					print("node: {}".format(node))
-					cmd= subprocess.check_output("ssh -t root@{} '/opt/sophos-av/bin/savdctl enable'".format(node),shell=True)
-					print("enabling antivirus on node: {}, output: {}".format(node, cmd))
-				except:
-					return{'state':'error'},200
-				return {'state':'enabling'}
+			#timestamp = time.time()
+			if 'ctid' in request.args:
+				if request.args['switch'] == 'off':
+					node = request.args['node']
+					ctid = request.args['ctid']
+					try:
+						print("node: {}, ctid: {}".format(node,ctid))
+						r.hset(node,'ctid',ctid)
+						cmd= subprocess.check_output("ssh -t root@{} '/opt/sophos-av/bin/savdctl disable'".format(node), shell=True)
+						print("disabling antivirus on node: {}, output: {}".format(node, cmd))
+					except:
+						return{'state':'error'},200
+					return {'state':'disabling'},200
+				if request.args['switch'] == 'on':
+					node = request.args['node']
+					ctid = request.args['ctid']
+					lock = r.hget(node,'ctid')
+					if lock == ctid or lock is None:
+						try:
+							print("node: {}".format(node))
+							cmd= subprocess.check_output("ssh -t root@{} '/opt/sophos-av/bin/savdctl enable'".format(node),shell=True)
+							r.hdel(node,ctid)
+							print("enabling antivirus on node: {}, output: {}".format(node, cmd))
+						except:
+							return{'state':'error'},200
+						return {'state':'enabling'},200
+					else:
+						return {'state':'enabling deferred, another CTID has the lock'}
+			else:
+				return {'error':'CTID not specified, required for racing lock'},400
 		else:
 			return {'error':'switch not specified, should be "on" or "off"'},400
 	@auth.login_required
