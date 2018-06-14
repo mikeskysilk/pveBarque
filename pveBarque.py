@@ -27,7 +27,7 @@ r_pw = config['redis']['password']  # Redis server password
 locations = {}  # backup storage destinations
 for option in config.options('destinations'):
     locations[option] = config.get('destinations', option)
-version = '0.79f'
+version = '0.79g'
 starttime = None
 
 # global vars
