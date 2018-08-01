@@ -25,9 +25,15 @@ r_host = config['redis']['host']  # Redis server host
 r_port = int(config['redis']['port'])  # Redis server port
 r_pw = config['redis']['password']  # Redis server password
 locations = {}  # backup storage destinations
+barque_storage = {}
+barque_ips = {}
 for option in config.options('destinations'):
     locations[option] = config.get('destinations', option)
-version = '0.79g'
+for option in config.options('barque_storage'):
+    barque_storage[option] = config.get('barque_storage', option)
+for option in config.options('barque_ips'):
+    barque_ips[option] = config.get('barque_ips', option)
+version = '0.80'
 starttime = None
 
 # global vars
@@ -67,7 +73,7 @@ class Worker(multiprocessing.Process):
                             self.restore(job)
                         elif task == 'scrub':
                             self.scrubSnaps(job)
-                        elif task == 'import':
+                        elif task == 'migrate':
                             self.migrate(job)
                         elif task == 'poisoned':
                             self.poison(job)
@@ -498,12 +504,130 @@ class Worker(multiprocessing.Process):
         r.hset(vmid, 'state', 'OK')
         r.hset(vmid, 'msg', 'Task successfully cancelled')
         return
-    def migrate(self, vmid):
-        pass
 
-####				    ####
-## pveBarque API Classes ##
-####			 	    ####
+    def migrate(self, vmid):
+                #TODO: Check if target cluster is known
+                #TODO: Add Poisoning
+                #TODO: Refactor for alternate storage destinations
+                #TODO: Move rate limit to config
+        r.hset(vmid, 'state', 'active')
+        target_file = r.hget(vmid, 'file')
+        target_cluster = r.hget(vmid, 'target_cluster')
+        config_file = ""
+        node = ""
+        dest_disk = ""
+        dest_storage = ""
+
+        ##
+        ## Gather Information
+        ##
+
+        r.hset(vmid, 'msg', 'collecting information')
+        #Find node hosting destingation container, get config_file
+        config_target = "{}.conf".format(vmid)
+        for paths, dirs, files in os.walk('/etc/pve/nodes'):
+            if config_target in files:
+                config_file = os.path.join(paths, config_target)
+                print(config_file)
+                node = config_file.split('/')[4]
+                print(node)
+        if len(config_file) == 0:
+            r.hset(vmid, 'state', 'error')
+            r.hset(vmid, 'msg', 'unable to locate container')
+            return
+
+        # get storage info from running container
+        parserCurr = configparser.ConfigParser()
+        with open(config_file) as lines:
+            lines = itertools.chain(("[root]",), lines)
+            parserCurr.read_file(lines)
+        try:
+            dest_storage, dest_disk = parserCurr['root']['rootfs'].split(',')[0].split(':')
+            print(dest_disk)
+        except:
+            r.hset(vmid, 'state', 'error')
+            r.hset(vmid, 'msg', 'unable to get storage info from active config file')
+            return
+
+        # get info of target barque node
+        target_ip = barque_ips[target_cluster]
+        target_path = barque_storage[target_cluster]
+
+        ##
+        ## Perform Operations
+        ##
+
+        # stop container if not already stopped
+        r.hset(vmid, 'msg', 'stopping container')
+        if not loads(subprocess.check_output("pvesh get /nodes/{}/lxc/{}/status/current".format(node, vmid), shell=True))["status"] == "stopped":
+            ctstop = subprocess.check_output("pvesh create /nodes/{}/lxc/{}/status/stop".format(node, vmid), shell=True)
+        timeout = time.time() + 60
+        while True:  # wait for container to stop
+            stat = loads(subprocess.check_output("pvesh get /nodes/{}/lxc/{}/status/current".format(node,vmid), shell=True))["status"]
+            print(stat)
+            if stat == "stopped":
+                break
+            elif time.time() > timeout:
+                r.hset(vmid, 'state', 'error')
+                r.hset(vmid, 'msg', 'Unable to stop container - timeout')
+                return
+
+        try:
+            r.hset(vmid, 'msg', 'Fetching backup image')
+            cmd = subprocess.check_output("ssh root@{} \"cat {}{}\" | mbuffer -r 10M | lz4 -d - {}{}.img".format(target_ip, target_path, target_file, locations[locations.keys()[-1]], vmid), shell=True)
+            #print(cmd)
+        except:
+            r.hset(vmid, 'state', 'error')
+            r.hset(vmid, 'msg', 'unable to fetch backup image')
+            return
+
+        try: # Delete disk if it exists
+            subprocess.check_call("rbd info {}{}".format(pool, dest_disk), shell=True)
+            r.hset(vmid, 'msg', 'removing container image')
+            try:
+                imgdel = subprocess.check_output("pvesh delete /nodes/{}/storage/{}/content/{}:{}".format(node, dest_storage,
+                                                                             dest_storage, dest_disk), shell=True)
+                print(imgdel)
+            except:
+                try:  # attempt to force unmap image and pray
+                    cmd = subprocess.check_output("rbd unmap -o force {}{}".format(pool, dest_disk))
+                except:
+                    r.hset(vmid, 'state', 'error')
+                    r.hset(vmid, 'msg', "unable to unmap container image")
+                    return
+                try:  # retry deleting image
+                    cmd = subprocess.check_output("pvesh delete /nodes/{}/storage/{}/content/{}:{}".format(node,  dest_storage,
+                                                                                 dest_storage, dest_disk),
+                        shell=True)
+                except:
+                    r.hset(vmid, 'state', 'error')
+                    r.hset(vmid, 'msg', "unable to remove container image", shell=True)
+                    return
+        except:
+            print("disk does not exist, proceeding")
+        try:
+            r.hset(vmid, 'msg', 'Importing disk image')
+            cmd = subprocess.check_output("rbd import --export-format 2 {}{}.img {}{}".format(locations[locations.keys()[-1]], vmid, pool, dest_disk), shell=True)
+            print(cmd)
+        except:
+            r.hset(vmid, 'state', 'error')
+            r.hset(vmid, 'msg', 'unable to import disk image')
+            return
+        ##
+        ## Clean up
+        ##
+
+        r.hset(vmid, 'msg', 'Cleaning up...')
+        os.remove("{}{}.img".format(locations[locations.keys()[-1]], vmid))
+        ctstart = subprocess.check_output("pvesh create /nodes/{}/lxc/{}/status/start".format(node, vmid), shell=True)
+        r.hset(vmid, 'state', 'OK')
+        r.hset(vmid, 'msg', 'Migration complete')
+        r.srem('joblock', vmid)
+        return
+
+####                     ####
+##  pveBarque API Classes  ##
+####                     ####
 
 class Backup(Resource):
     @auth.login_required
@@ -670,6 +794,7 @@ class ListBackups(Resource):
                 return response, err
         files = sorted(os.path.basename(f) for f in glob("".join([path, "vm-{}-disk*.lz4".format(vmid)])))
         return {'backups': files}
+
 class DeleteBackup(Resource):
     @auth.login_required
     def post(self, vmid):
@@ -829,6 +954,7 @@ class Info(Resource):
                 container = ""
             workerStatus[worker.name] = {'Health': healthy, 'Job': task, 'Message': message, 'CTID': container}
         response['workers'] = workerStatus
+        print(workerTask)
         # destination status
         dests = {}
         for spot in locations.keys():
@@ -915,6 +1041,31 @@ class AVtoggle(Resource):
         else:
             return {'error': "Problem determining AV status"}, 500
 
+class Migrate(Resource):
+    @auth.login_required
+    def post(self, vmid):
+        # Check if file is specified
+        if 'file' not in request.args:
+            return {'error': 'Resource requires a file argument'}, 400
+        # Check if destination container does not exist
+        if not checkConf(vmid):
+            return {'error': "{} is not a valid CTID"}, 400
+        # Check if cluster is specified
+        if 'cluster' not in request.args:
+            return {'error': 'Resource requires a cluster argument (dtla01, dtla02, dtla03, dtla04, ny01)'}, 400
+        # Check if container is available
+        if str(vmid) in r.smembers('joblock'):
+            return {'error': "VMID locked, another operation is in progress for container: {}".format(vmid)}, 409
+
+        r.hset(vmid, 'job', 'migrate')
+        r.hset(vmid, 'file', request.args['file'])
+        r.hset(vmid, 'worker', '')
+        r.hset(vmid, 'msg', '')
+        r.hset(vmid, 'target_cluster', request.args['cluster'])
+        r.hset(vmid, 'state', 'enqueued')
+        r.sadd('joblock', vmid)
+
+        return {'status': "restore job created for CTID {}".format(vmid)}, 202
 
 api.add_resource(ListAllBackups, '/barque/')
 api.add_resource(ListBackups, '/barque/<int:vmid>')
@@ -929,6 +1080,7 @@ api.add_resource(ClearQueue, '/barque/all/clear')
 api.add_resource(CleanSnaps, '/barque/all/clean')
 api.add_resource(Poison, '/barque/<int:vmid>/poison')
 api.add_resource(AVtoggle, '/barque/avtoggle')
+api.add_resource(Migrate, '/barque/<int:vmid>/migrate')
 
 def sanitize():
     for item in r.smembers('joblock'):
