@@ -56,7 +56,7 @@ for item in config['barque_ips'].items():
 #         pmx_clusters[r][c] = {}
 #     pmx_clusters[r][c][n]=v
 _password = config['proxmox']['password']
-version = '0.8.3'
+version = '0.9.0'
 starttime = None
 
 # global vars
@@ -85,6 +85,36 @@ log.info('Barque Logging Initialized.')
 
 proxmox = ProxmoxAPI(_host, user='root@pam', password=_password, verify_ssl=False)
 
+class Foreman(multiprocessing.Process):
+    stick = None
+    r = None
+    def run(self):
+        r = redis.Redis(host=r_host, port=r_port, password=r_pw)
+        self.stick = logging.getLogger('Barque.Foreman')
+        self.stick.info("Foreman logging started")
+        while True:
+            self.stick.debug("Foreman loop tick")
+            containers = self.update_inventory()
+            self.update_master_list(containers)
+            time.sleep(30.0 - (time.time() % 30.0))
+
+    def update_inventory(self):
+        containers = {}
+        for node in os.listdir('/etc/pve/nodes'):
+            self.stick.debug("Getting list for node {}".format(node))
+            try:
+                socket_list = subprocess.check_output('ssh {} \"awk \'{{ print \$8 }}\' /proc/net/unix | grep /var/lib/lxc/.*/command\"'.format(node), shell=True).split('\n')[:-1]
+            except subprocess.CalledProcessError as e:
+                self.stick.debug("Error getting containers from {}: {}".format(node, e.output))
+                self.stick.debug("Assuming no containers exist, setting to 0")
+                containers[node] = "0"
+                continue
+            containers[node] = len(socket_list)
+        return containers
+
+    def update_master_list(self, containers):
+        for key in containers:
+            r.hset('inventory',key, containers[key])
 
 class Worker(multiprocessing.Process):
     # TODO: Create 'stop container' function
@@ -400,7 +430,7 @@ class Worker(multiprocessing.Process):
                 r.hset(vmid, 'state', 'error')
                 r.hset(vmid, 'msg', 'Unable to stop container - timeout')
                 return
-            time.sleep(1)
+            time.sleep(10)
 
         # make recovery copy of container image
         self.stick.info('{}:restore: Creating disaster recovery image'.format(vmid))
@@ -439,7 +469,7 @@ class Worker(multiprocessing.Process):
         # delete container storage
         r.hset(vmid, 'msg', 'removing container image')
         self.stick.debug('{}:restore: removing container image'.format(vmid))
-        timeout = time.time() + 120
+        timeout = time.time() + 300
         while True:
             if time.time() > timeout:
                 self.stick.error('{}:restore: Unable to remove container image, timed out'.format(vmid))
@@ -462,7 +492,7 @@ class Worker(multiprocessing.Process):
                     break # Exit loop if vmdisk not found (i.e. it's deleted)
             except:
                 self.stick.error('{}:restore: unable to retrieve list of storage from Proxmox, trying again.')
-            time.sleep(5)
+            time.sleep(30)
 
 
         # try:
@@ -714,7 +744,7 @@ class Worker(multiprocessing.Process):
         # get info of target barque node
         target_ip =''
         migration_rate='50'
-        target_region, target_cluster_id, blank = re.split('(\d+)',target_cluster)
+        target_region, target_cluster_id, blank = re.split('(\d+)',target_cluster.lower())
         if target_region in barque_ips:
             if target_cluster_id in barque_ips[target_region]:
                 target_ip = barque_ips[target_region][target_cluster_id]
@@ -724,7 +754,7 @@ class Worker(multiprocessing.Process):
         else:
             r.hset(vmid, 'state', 'error')
             r.hset(vmid, 'msg', 'Cluster region not configured')
-        target_path = barque_storage[target_cluster]
+        target_path = barque_storage[target_cluster.lower()]
 
         # check if poisoned 1
         if r.hget(vmid,'job') == "poisoned":
@@ -1501,6 +1531,38 @@ class Migrate(Resource):
 
         return {'status': "migrate job created for CTID {}".format(vmid)}, 202
 
+class Inventory(Resource):
+    @auth.login_required
+    def get(self):
+        result = {}
+        hasArgs=False
+        if 'cluster' in request.args:
+            result['total'] = self.get_total()
+            hasArgs=True
+        if 'node' in request.args:
+            node = request.args['node']
+            if node in os.listdir('/etc/pve/nodes'):
+                specificNodes={}
+                specificNodes[node] = r.hget('inventory',node)
+                result['nodes'] = specificNodes
+            else:
+                return {'error':"node does not exist in cluster"},400
+            hasArgs=True
+        if hasArgs:
+            return result, 200
+        container_count = {}
+        for node in os.listdir('/etc/pve/nodes'):
+            try:
+                container_count[node] = r.hget('inventory',node)
+            except:
+                continue
+        return {'total': self.get_total(), 'nodes': container_count}, 200
+
+    def get_total(self):
+        total = 0
+        for node in os.listdir('/etc/pve/nodes'):
+            total = total + int(r.hget('inventory',node))
+        return total
 
 api.add_resource(ListAllBackups, '/barque/')
 api.add_resource(ListBackups, '/barque/<int:vmid>')
@@ -1516,6 +1578,7 @@ api.add_resource(CleanSnaps, '/barque/all/clean')
 api.add_resource(Poison, '/barque/<int:vmid>/poison')
 api.add_resource(AVtoggle, '/barque/avtoggle')
 api.add_resource(Migrate, '/barque/<int:vmid>/migrate')
+api.add_resource(Inventory, '/barque/count')
 
 
 def sanitize():
@@ -1577,9 +1640,13 @@ if __name__ == '__main__':
     r = redis.Redis(host=r_host, port=r_port, password=r_pw)
     sanitize()
     log.info("redis connection successful")
+    f = Foreman()
+    f.start()
+    log.debug("Foreman started")
     for i in range(minions):
         p = Worker()
         workers.append(p)
         p.start()
         log.debug("worker started")
-    app.run(host=_host, port=_port, debug=True, ssl_context=(cert, key), use_reloader=False)
+    app.debug=False
+    app.run(host=_host, port=_port, debug=False, use_reloader=False, ssl_context=(cert, key))
