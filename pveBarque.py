@@ -56,7 +56,7 @@ for item in config['barque_ips'].items():
 #         pmx_clusters[r][c] = {}
 #     pmx_clusters[r][c][n]=v
 _password = config['proxmox']['password']
-version = '0.9.0'
+version = '0.9.1'
 starttime = None
 
 # global vars
@@ -93,7 +93,7 @@ class Foreman(multiprocessing.Process):
         self.stick = logging.getLogger('Barque.Foreman')
         self.stick.info("Foreman logging started")
         while True:
-            self.stick.debug("Foreman loop tick")
+            self.stick.debug("Foreman updating inventory")
             containers = self.update_inventory()
             self.update_master_list(containers)
             time.sleep(30.0 - (time.time() % 30.0))
@@ -101,12 +101,12 @@ class Foreman(multiprocessing.Process):
     def update_inventory(self):
         containers = {}
         for node in os.listdir('/etc/pve/nodes'):
-            self.stick.debug("Getting list for node {}".format(node))
+            #self.stick.debug("Getting list for node {}".format(node))
             try:
                 socket_list = subprocess.check_output('ssh {} \"awk \'{{ print \$8 }}\' /proc/net/unix | grep /var/lib/lxc/.*/command\"'.format(node), shell=True).split('\n')[:-1]
             except subprocess.CalledProcessError as e:
-                self.stick.debug("Error getting containers from {}: {}".format(node, e.output))
-                self.stick.debug("Assuming no containers exist, setting to 0")
+                #self.stick.debug("Error getting containers from {}: {}".format(node, e.output))
+                #self.stick.debug("Assuming no containers exist, setting to 0")
                 containers[node] = "0"
                 continue
             containers[node] = len(socket_list)
@@ -334,7 +334,7 @@ class Worker(multiprocessing.Process):
             r.hset(vmid, 'msg', 'failed to connect to proxmox')
             return
         self.stick.debug("{} connected to proxmox".format(self.name))
-
+        self.stick.info("{}:restore: Beginning restore process".format(vmid))
         config_file = ""
         node = ""
         destination = r.hget(vmid, 'dest')
@@ -405,6 +405,12 @@ class Worker(multiprocessing.Process):
             r.hset(vmid, 'state', 'OK')
             return
 
+        # Remove from HA
+        try:
+            cmd = subprocess.check_output('ha-manager remove ct:{}'.format(vmid), shell=True)
+            self.stick.debug("{}:restore: Removed CT from HA")
+        except subprocess.CalledProcessError as e:
+            self.stick.error("{}:restore: Unable to remove CT from HA")
         # stop container if not already stopped
         r.hset(vmid, 'msg', 'stopping container')
         self.stick.info('{}:restore: Checking if container is stopped'.format(vmid))
@@ -432,26 +438,35 @@ class Worker(multiprocessing.Process):
                 return
             time.sleep(10)
 
+        # Check if disk image exists
+        exists = True
+        try:
+            subprocess.check_output('rbd info {}/{}'.format(pool, vmdisk_current), shell=True)
+        except subprocess.CalledProcessError as e:
+            exists = False
+            self.stick.debug('{}:restore: Disk image not present on first pass'.format(vmid))
         # make recovery copy of container image
-        self.stick.info('{}:restore: Creating disaster recovery image'.format(vmid))
-        r.hset(vmid, 'msg', 'creating disaster recovery image')
-        imgcpy = subprocess.check_output("rbd cp --rbd-concurrent-management-ops 20 {}/{} {}/{}-barque".format(pool,
-                                                                                                        vmdisk_current,
-                                                                                                        pool,
-                                                                                                        vmdisk_current),
-                                         shell=True)
-        self.stick.debug('{}:restore: finished creating disaster recovery image: {}/{}-barque'.format(vmid,
-                                                                                                     pool,
-                                                                                                     vmdisk_current))
+        if exists:
+            self.stick.info('{}:restore: Creating disaster recovery image'.format(vmid))
+            r.hset(vmid, 'msg', 'creating disaster recovery image')
+            imgcpy = subprocess.check_output("rbd cp --rbd-concurrent-management-ops 20 {}/{} {}/{}-barque".format(pool,
+                                                                                                            vmdisk_current,
+                                                                                                            pool,
+                                                                                                            vmdisk_current),
+                                             shell=True)
+            self.stick.debug('{}:restore: finished creating disaster recovery image: {}/{}-barque'.format(vmid,
+                                                                                                         pool,
+                                                                                                         vmdisk_current))
         # print("Waiting for poison test2")
         # time.sleep(15)
         # check if poisoned 2
         if r.hget(vmid, 'job') == 'poisoned':
             self.stick.debug('{}:restore: Reached Poisoned 2'.format(vmid))
             try:
-                # remove recovery copy
-                imgrm = subprocess.check_output("rbd rm {}/{}-barque".format(pool, vmdisk_current), shell=True)
-                self.stick.debug('{}:restore: Poisoned 2 - removed disaster recovery image'.format(vmid))
+                if exists:
+                    # remove recovery copy
+                    imgrm = subprocess.check_output("rbd rm {}/{}-barque".format(pool, vmdisk_current), shell=True)
+                    self.stick.debug('{}:restore: Poisoned 2 - removed disaster recovery image'.format(vmid))
                 # un-stop container
                 self.proxconn.nodes(node).lxc(vmid).status.start.create()
                 self.stick.debug('{}:restore: Poisoned 2 - start container request created'.format(vmid))
@@ -466,53 +481,162 @@ class Worker(multiprocessing.Process):
             self.stick.info('{}:restore: Poisoned 2 - Successfully poisoned, worker returning to queue'.format(vmid))
             return
 
+        #
         # delete container storage
-        r.hset(vmid, 'msg', 'removing container image')
-        self.stick.debug('{}:restore: removing container image'.format(vmid))
-        timeout = time.time() + 300
-        while True:
-            if time.time() > timeout:
-                self.stick.error('{}:restore: Unable to remove container image, timed out'.format(vmid))
-                r.hset(vmid, 'state', 'error')
-                r.hset(vmid, 'msg', 'Unable to remove container image, timed out')
-                return
-            self.stick.debug('{}:restore: Attempting to remove container image, looped!'.format(vmid))
-            found = False
+        #
+
+        # Helper functions which will be used repeatedly
+        def unmap_rbd(self, force=False):
+            '''
+            Uses rbd unmap to unmap the rbd device, over ssh to the target node.
+            Accepts boolean argument "force" to include the -o force flag on if True, absent if False
+            Returns True if the unmap command was successful.
+            '''
+            time.sleep(5)
+            if force:
+                try:
+                    cmd = subprocess.check_output(
+                        'ssh {} \'rbd unmap -o force {}/{}\''.format(node, pool, vmdisk_current), shell=True
+                        )
+                except subprocess.CalledProcessError as e:
+                    self.stick.error("{}:restore:unmapRBD: Unable to force unmap disk".format(vmid))
+                    return False
+            else:
+                try:
+                    cmd = subprocess.check_output(
+                        'ssh {} \'rbd unmap {}/{}\''.format(node, pool, vmdisk_current), shell=True
+                        )
+                except subprocess.CalledProcessError as e:
+                    self.stick.error("{}:restore:unmapRBD: Unable to unmap disk, probably still in use".format(vmid))
+                    return False
+            return True
+        def rm_vmdisk(self):
+            '''
+            Uses rbd rm to remove the disk image.
+            Returns True if the rm command was successful.
+            '''
+            time.sleep(5)
             try:
-                for item in self.proxconn.nodes(node).storage(storage_current).content.get():
-                    if item['name'] == vmdisk_current:
+                cmd = subprocess.check_output('rbd rm {}/{}'.format(pool, vmdisk_current), shell=True)
+            except subprocess.CalledProcessError as e:
+                self.stick.error('{}:restore:rm_vmdisk Failed to remove disk with rbd rm'.format(vmid))
+                return False
+            return True
+
+        # Wait some time for everything to settle down before surgery
+        time.sleep(30)
+        # Check if storage exists   
+        exists = True
+        try:
+            subprocess.check_output('rbd info {}/{}'.format(pool, vmdisk_current), shell=True)
+        except subprocess.CalledProcessError as e:
+            exists = False
+            self.stick.debug('{}:restore: Disk image not present on first pass'.format(vmid))
+        
+        # Begin process of removing disk
+        if exists:
+            if rm_vmdisk(self):
+                exists = False              # Proceed
+            else:                           # Unmap routine
+                if unmap_rbd(self):
+                    if rm_vmdisk(self):
+                        exists= False       # Proceed
+                else:                       # Unable to unmap, check if CT is stopped
+                    try:
+                        cmd = subprocess.check_output('ssh {} \'pct status {}\''.format(node, vmid), shell=True)
+                        if cmd.strip('\n').split(' ')[1] == "running":
+                            try:
+                                cmd = subprocess.check_output('ssh {} \'pct stop {}\''.format(node, vmid), shell=True)
+                                time.sleep(30)
+                            except subprocess.CalledProcessError as e:
+                                self.stick.debug('{}:restore:disk_removal: Unable to stop container'.format(vmid))
+                            if unmap_rbd(self):
+                                if rm_vmdisk(self):
+                                    exists = False
+                                # else check for snapshots routine
+                            else:
+                                time.sleep(30)
+                                if unmap_rbd(self, True):
+                                    if rm_vmdisk(self):
+                                        exists = False
+                                    # else check for snapshots routine
+                                else: # holy fuck how did that not work??
+                                    r.hset(vmid, 'msg', 'Error unmapping rbd')
+                                    r.hset(vmid, 'state', 'error')
+                                    return
+                        else: #assume container is stopped or stopped in error state
+                            time.sleep(30)
+                            if unmap_rbd(self,True):
+                                if rm_vmdisk(self):
+                                    exists = False
+                                # else check for snapshots routine
+                            else: # holy fuck how did that not work??
+                                r.hset(vmid, 'msg', 'Error unmapping rbd')
+                                r.hset(vmid, 'state', 'error')
+                                return
+                    except subprocess.CalledProcessError as e:
+                        self.stick.debug('{}:restore:disk_removal: Unable to get status of ctid, hoping that it\'s off.'.format(vmid))
+        if exists: # Check for snapshots routine
+            snaps = None
+            try: # Check for snapshots
+                snaps = subprocess.check_output('rbd snap ls {}/{}'.format(pool, vmdisk_current), shell=True)
+            except subprocess.CalledProcessError as e: # Unable to get snapshots
+                pass # TODO: catch error
+            if snaps: #GodILovePython.jpg
+                for snap in snaps.split('\n')[1:-1]:
+                    snap_id = snap.split()[1]
+                    try:
+                        subprocess.check_output('rbd snap rm {}/{}@{}'.format(pool, vmdisk_current, snap_id), shell=True)
+                    except subprocess.CalledProcessError as e:
+                        # Attempt to unprotect and try removing again
+                        self.stick.debug("{}:restore:disk_removal: Unable to remove snapshot {}/{}@{}, attempting to\
+                         unprotect".format(
+                            vmid, 
+                            pool, 
+                            vmdisk_current, 
+                            snap_id
+                            )
+                         )
                         try:
-                            found = True
-                            self.stick.debug('{}:restore: container image found, attempting to remove (loop)'.format(vmid))
-                            self.proxconn.nodes(node).storage(storage_current).content(vmdisk_current).delete()
+                            subprocess.check_output('rbd snap unprotect {}/{}@{}'.format(pool, vmdisk_current, snap_id), 
+                                shell=True)
+                            self.stick.debug("{}:restore:disk_removal: Unprotected snapshot {}/{}@{}".format(
+                                vmid, 
+                                pool, 
+                                vmdisk_current, 
+                                snap_id
+                                )
+                             )
+                        except subprocess.CalledProcessError as e:
+                            self.stick.error("{}:restore:disk_removal Failed to unprotect snapshot, continuing on.".format(vmid))
+                            # Catch and release error, if there is a problem it will error after the next attempt to remove
+                        try:
+                            subprocess.check_output('rbd snap rm {}/{}@{}'.format(pool, vmdisk_current, snap_id), shell=True)
+                            self.stick.debug("{}:restore:disk_removal Removed snapshot {}".format(vmid, snap_id))
                         except:
-                            pass
-                if not found:
-                    self.stick.debug('{}:restore: container image not found, continuing with restore'.format(vmid))
-                    break # Exit loop if vmdisk not found (i.e. it's deleted)
-            except:
-                self.stick.error('{}:restore: unable to retrieve list of storage from Proxmox, trying again.')
-            time.sleep(30)
-
-
-        # try:
-        #     print("hello")
-        # except:
-        #     self.stick.warning('{}:restore: unable to delete container image'.format(vmid))
-        #     try:  # attempt to force unmap image if has watchers
-        #         cmd = subprocess.check_output("rbd unmap -o force {}{}".format(pool, vmdisk_current))
-        #     except:
-        #         r.hset(vmid, 'state', 'error')
-        #         r.hset(vmid, 'msg', "unable to unmap container image")
-        #         return
-        #     try:  # retry deleting image
-        #         self.proxconn.nodes(node).storage(storage_current).content(vmdisk_current).delete()
-        #         self.stick.info('{}:restore: Successfully deleted container storage after retry'.format(vmid))
-        #     except:
-        #         self.stick.error('{}:restore: unable to remove container image'.format(vmid))
-        #         r.hset(vmid, 'state', 'error')
-        #         r.hset(vmid, 'msg', "unable to remove container image")
-        #         return
+                            self.stick.error("{}:restore:disk_removal Unable to remove image snapshot {}/{}@{}".format(
+                                vmid,
+                                pool,
+                                vmdisk_current,
+                                snap_id
+                                )
+                            )
+                            r.hset(vmid, 'msg', 'Unable to remove snapshots')
+                            r.hset(vmid, 'state', 'error')
+                            return
+                    # continue
+                # End For loop
+            else: # No snaps found
+                self.stick.error("{}:restore:disk_removal Removal failed, and no snaps found. Not sure what to do so crash and burn".format(vmid))
+                r.hset(vmid, 'msg', 'Unable to remove container disk, also no snapshots found')
+        if exists:
+            if rm_vmdisk(self):
+                exists = False
+            else:
+                # Looks like we got a problem.
+                r.hset(vmid, 'msg', 'Error removing disk image')
+                r.hset(vmid, 'state', 'error')
+                return
 
         # extract lz4 compressed image file
         self.stick.debug('{}:restore: uncompressing backup file'.format(vmid))
@@ -568,6 +692,8 @@ class Worker(multiprocessing.Process):
         self.stick.debug('{}:restore: removed uncompressed backup image'.format(vmid))
 
         # delete barque snapshot
+        cmd = subprocess.check_output('rbd snap unprotect {}/{}@barque'.format(pool, vmdisk_final), shell=True)
+        self.stick.debug('{}:restore: unprotected barque snapshot'.format(vmid))
         cmd = subprocess.check_output('rbd snap rm {}/{}@barque'.format(pool, vmdisk_final), shell=True)
         self.stick.debug('{}:restore: removed barque snapshot'.format(vmid))
         # image attenuation for kernel params #Removed after switching to format 2
@@ -580,6 +706,9 @@ class Worker(multiprocessing.Process):
         if r.hget(vmid, 'job') == 'poisoned':
             self.stick.debug('{}:restore: Reached Poisoned 4'.format(vmid))
             try:
+                #
+                cmd = subprocess.check_output('rbd snap unprotect {}/{}@barque'.format(pool, vmdisk_final), shell=True)
+                self.stick.debug('{}:restore: unprotected barque snapshot'.format(vmid))
                 # try removing the recovered image
                 cmd = subprocess.check_output("rbd rm {}/{}".format(pool, vmdisk_current), shell=True)
                 # try adding container image
@@ -599,10 +728,33 @@ class Worker(multiprocessing.Process):
         copyfile(fileconf, config_file)
         self.stick.debug('{}:restore: config file replaced'.format(vmid))
 
+        ## Disabled due to IP change conflicts
         # start container
-        self.proxconn.nodes(node).lxc(vmid).status.start.create()
-        # time.sleep(5)
-        self.stick.debug('{}:restore: start container request sent'.format(vmid))
+        # try:
+        #     subprocess.check_output(
+        #         'ssh {} \'pct start {}\''.format(node, vmid), 
+        #         shell=True
+        #         )
+        #     self.stick.info('{}:restore: Container started'.format(vmid))
+        # except subprocess.CalledProcessError as e:
+        #     self.stick.error('{}:restore: Unable to start container'.format(vmid))
+        #     r.hset(vmid, 'msg', 'Unable to start container')
+        #     r.hset(vmid, 'state', 'error')
+        #     return
+
+        # # Execute ping test 
+        # try:
+        #     time.sleep(10)
+        #     cmd=subprocess.check_output('ssh {} \'echo \"ping -c1 -W 60 google.com\" \
+        #         | lxc-attach -n {} -- bash\''.format(
+        #             node,
+        #             vmid
+        #             ),
+        #         shell=True)
+        # except subprocess.CalledProcessError as e:
+        #     self.stick.error('{}:restore: Unable to ping google.com after starting container'.format(vmid))
+        #     r.hset(vmid, 'msg', 'error')
+        #     r.hset(vmid, 'state', 'error')
 
         # cleanup recovery copy
         cmd = subprocess.check_output("rbd rm {}/{}-barque".format(pool, vmdisk_current), shell=True)
