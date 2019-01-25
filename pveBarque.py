@@ -56,7 +56,7 @@ for item in config['barque_ips'].items():
 #         pmx_clusters[r][c] = {}
 #     pmx_clusters[r][c][n]=v
 _password = config['proxmox']['password']
-version = '0.9.1'
+version = '0.9.2'
 starttime = None
 
 # global vars
@@ -724,37 +724,52 @@ class Worker(multiprocessing.Process):
                 return
             r.srem('joblock', vmid)
             return
-        # replace config file
-        copyfile(fileconf, config_file)
-        self.stick.debug('{}:restore: config file replaced'.format(vmid))
+        
+        # Get current IP address 
+        ipline = ""
+        with open(config_file, 'r') as current_conf:
+            for line in current_conf:
+                if line.startswith('net0:'):
+                    ipline = line
+                    break
+
+        # replace config file, injecting IP address
+        with open(config_file, 'w') as current_conf:
+            with open(fileconf, 'r') as backup_conf:
+                for line in backup_conf:
+                    if line.startswith('net0:'):
+                        current_conf.write(ipline)
+                        continue
+                    current_conf.write(line)
+
 
         ## Disabled due to IP change conflicts
         # start container
-        # try:
-        #     subprocess.check_output(
-        #         'ssh {} \'pct start {}\''.format(node, vmid), 
-        #         shell=True
-        #         )
-        #     self.stick.info('{}:restore: Container started'.format(vmid))
-        # except subprocess.CalledProcessError as e:
-        #     self.stick.error('{}:restore: Unable to start container'.format(vmid))
-        #     r.hset(vmid, 'msg', 'Unable to start container')
-        #     r.hset(vmid, 'state', 'error')
-        #     return
+        try:
+            subprocess.check_output(
+                'ssh {} \'pct start {}\''.format(node, vmid), 
+                shell=True
+                )
+            self.stick.info('{}:restore: Container started'.format(vmid))
+        except subprocess.CalledProcessError as e:
+            self.stick.error('{}:restore: Unable to start container'.format(vmid))
+            r.hset(vmid, 'msg', 'Unable to start container')
+            r.hset(vmid, 'state', 'error')
+            return
 
-        # # Execute ping test 
-        # try:
-        #     time.sleep(10)
-        #     cmd=subprocess.check_output('ssh {} \'echo \"ping -c1 -W 60 google.com\" \
-        #         | lxc-attach -n {} -- bash\''.format(
-        #             node,
-        #             vmid
-        #             ),
-        #         shell=True)
-        # except subprocess.CalledProcessError as e:
-        #     self.stick.error('{}:restore: Unable to ping google.com after starting container'.format(vmid))
-        #     r.hset(vmid, 'msg', 'error')
-        #     r.hset(vmid, 'state', 'error')
+        # Execute ping test 
+        try:
+            time.sleep(10)
+            cmd=subprocess.check_output('ssh {} \'echo \"ping -c1 -W 60 google.com\" \
+                | lxc-attach -n {} -- bash\''.format(
+                    node,
+                    vmid
+                    ),
+                shell=True)
+        except subprocess.CalledProcessError as e:
+            self.stick.error('{}:restore: Unable to ping google.com after starting container'.format(vmid))
+            r.hset(vmid, 'msg', 'error')
+            r.hset(vmid, 'state', 'error')
 
         # cleanup recovery copy
         cmd = subprocess.check_output("rbd rm {}/{}-barque".format(pool, vmdisk_current), shell=True)
