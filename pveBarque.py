@@ -116,6 +116,23 @@ class Foreman(multiprocessing.Process):
         for key in containers:
             r.hset('inventory',key, containers[key])
 
+    def get_node_utilizations(self):
+        node_loads = {}
+        for node in os.listdir('/etc/pve/nodes'):
+            try:
+                node_status = subprocess.check_output('pvesh get nodes/{}/status'.format(node), shell=True)
+            except subprocess.CalledProcessError as e:
+                self.stick.error('Unable to get status of {}'.format(node))
+                continue
+            try:
+                node_load = loads(node_status)['loadavg'][2]
+                node_loads[node] = node_load
+            except:
+                self.stick.error('Unable to parse status json for node {}'.format(node))
+                continue
+
+
+
 class Worker(multiprocessing.Process):
     # TODO: Create 'stop container' function
     r = None
@@ -692,10 +709,16 @@ class Worker(multiprocessing.Process):
         self.stick.debug('{}:restore: removed uncompressed backup image'.format(vmid))
 
         # delete barque snapshot
-        cmd = subprocess.check_output('rbd snap unprotect {}/{}@barque'.format(pool, vmdisk_final), shell=True)
-        self.stick.debug('{}:restore: unprotected barque snapshot'.format(vmid))
-        cmd = subprocess.check_output('rbd snap rm {}/{}@barque'.format(pool, vmdisk_final), shell=True)
-        self.stick.debug('{}:restore: removed barque snapshot'.format(vmid))
+        try:
+            cmd = subprocess.check_output('rbd snap unprotect {}/{}@barque'.format(pool, vmdisk_final), shell=True)
+            self.stick.debug('{}:restore: unprotected barque snapshot'.format(vmid))
+        except subprocess.CalledProcessError as e:
+            self.stick.error('{}:restore: Unable to unprotect snapshot, assuming already unprotected'.format(vmid))
+        try:
+            cmd = subprocess.check_output('rbd snap rm {}/{}@barque'.format(pool, vmdisk_final), shell=True)
+            self.stick.debug('{}:restore: removed barque snapshot'.format(vmid))
+        except subprocess.CalledProcessError as e:
+            self.stick.debug('{}:restore: unable to remove barque snapshot, continuing anyway'.format(vmid))
         # image attenuation for kernel params #Removed after switching to format 2
         # imgatten = subprocess.check_output("rbd feature disable {} object-map fast-diff deep-flatten".format(vmdisk), shell=True)
         # print(imgatten)
