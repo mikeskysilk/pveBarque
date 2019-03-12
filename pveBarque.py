@@ -59,7 +59,7 @@ for item in config['barque_ips'].items():
 #         pmx_clusters[r][c] = {}
 #     pmx_clusters[r][c][n]=v
 _password = config['proxmox']['password']
-version = '0.10.0'
+version = '0.10.1'
 starttime = None
 
 # global vars
@@ -919,9 +919,12 @@ class Worker(multiprocessing.Process):
         dest_storage = ""
         dest_pool = ""
         try:
-            self.proxconn = ProxmoxAPI(_host, user='root@pam',
-                password=_password, verify_ssl=False)
-        except:
+            self.proxconn = ProxmoxAPI(
+                _host,
+                user='root@pam',
+                password=_password,
+                verify_ssl=False)
+        except Exception:
             r.hset(vmid, 'state', 'error')
             r.hset(vmid, 'msg', 'failed to connect to proxmox')
             return
@@ -1371,9 +1374,10 @@ class Worker(multiprocessing.Process):
             cmd = subprocess.check_output(
                 'ha-manager remove ct:{}'.format(vmid),
                 shell=True)
-            self.stick.debug("{}:destroy: Removed CT from HA")
+            self.stick.debug("{}:destroy: Removed CT from HA".format(vmid))
         except subprocess.CalledProcessError:
-            self.stick.error("{}:destroy: Unable to remove CT from HA")
+            self.stick.error(
+                "{}:destroy: Unable to remove CT from HA".format(vmid))
 
         # stop container if not already stopped
         r.hset(vmid, 'msg', 'stopping container')
@@ -1393,27 +1397,29 @@ class Worker(multiprocessing.Process):
                 r.hset(vmid, 'msg', 'unable to stop container - proxmox api '
                                     'returned null')
                 return
-        timeout = time.time() + 60
-        while True:  # wait for container to stop
-            self.stick.debug(
-                '{}:destroy: checking if container has stopped'.format(vmid))
-            status = self.proxconn.nodes(
-                node).lxc(vmid).status.current.get()["status"]
-            self.stick.debug('{}:restore: container state: {}'.format(
-                vmid,
-                status))
-            if status == "stopped":
+            timeout = time.time() + 60
+            while True:  # wait for container to stop
                 self.stick.debug(
-                    '{}:destroy: container stopped successfully'.format(vmid))
-                break
-            elif time.time() > timeout:
-                self.stick.error(
-                    '{}:destroy: unable to stop container - timeout')
-                r.hset(vmid, 'state', 'error')
-                r.hset(vmid, 'msg', 'Unable to stop container - timeout')
-                return
-            time.sleep(10)
-
+                    '{}:destroy: checking if container has stopped'.format(vmid))
+                status = self.proxconn.nodes(
+                    node).lxc(vmid).status.current.get()["status"]
+                self.stick.debug('{}:restore: container state: {}'.format(
+                    vmid,
+                    status))
+                if status == "stopped":
+                    self.stick.debug(
+                        '{}:destroy: container stopped successfully'.format(vmid))
+                    break
+                elif time.time() > timeout:
+                    self.stick.error(
+                        '{}:destroy: unable to stop container - timeout')
+                    r.hset(vmid, 'state', 'error')
+                    r.hset(vmid, 'msg', 'Unable to stop container - timeout')
+                    return
+                time.sleep(10)
+        else:
+            self.stick.debug(
+                '{}:destroy: container already stopped'.format(vmid))
         ##
         # Unmap the RBD disk
         ##
@@ -1471,7 +1477,10 @@ class Worker(multiprocessing.Process):
                 r.hset(vmid, 'msg', 'Error getting container status from '
                                     'proxmox')
             time.sleep(10)
-        if self.proxconn.nodes(node).lxc(vmid).status.current.get():
+        # Check if container was destroyed the first time
+        status = ""
+        try:
+            self.proxconn.nodes(node).lxc(vmid).status.current.get()
             # Still alive, eh?
             time.sleep(120)  # Wait for a while longer, then try proxmox again
             try:
@@ -1500,15 +1509,24 @@ class Worker(multiprocessing.Process):
                                         'proxmox')
                 time.sleep(10)
 
-            if self.proxconn.nodes(node).lxc(vmid).status.current.get():
+            try:
+                self.proxconn.nodes(node).lxc(vmid).status.current.get()
                 # give up.
                 self.stick.error("{}:destroy: Proxmox is seriously unable to "
                                  "delete the container".format(vmid))
                 r.hset(vmid, 'msg', 'Unable to delete container')
                 r.hset(vmid, 'state', 'error')
+                return
+            except proxmoxer.core.ResourceException:
+                self.stick.info(
+                    '{}:destroy: Container no longer present'.format(vmid))
+        except proxmoxer.core.ResourceException:
+            self.stick.info(
+                '{}:destroy: Container no longer present'.format(vmid))
 
         r.hset(vmid, 'msg', 'container deleted')
         r.hset(vmid, 'state', 'OK')
+        r.srem('joblock', vmid)
         return
 
 # ##                     ## #
@@ -2049,7 +2067,7 @@ api.add_resource(Poison, '/barque/<int:vmid>/poison')
 api.add_resource(AVtoggle, '/barque/avtoggle')
 api.add_resource(Migrate, '/barque/<int:vmid>/migrate')
 api.add_resource(Inventory, '/barque/count')
-api.add_resource(Destroy, '/barque/destroy')
+api.add_resource(Destroy, '/barque/<int:vmid>/destroyContainer')
 
 
 def sanitize():
@@ -2076,9 +2094,12 @@ def checkConf(vmid):
             config_file = os.path.join(paths, config_target)
             print(config_file)
     if len(config_file) == 0:
-        r.hset(vmid, 'state', 'error')
-        r.hset(vmid, 'msg', '{} is invalid CTID'.format(vmid))
-        return False
+        if r.hget(vmid, 'job') == 'destroy':
+            return True
+        else:
+            r.hset(vmid, 'state', 'error')
+            r.hset(vmid, 'msg', '{} is invalid CTID'.format(vmid))
+            return False
     return True
 
 
