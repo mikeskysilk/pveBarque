@@ -59,7 +59,7 @@ for item in config['barque_ips'].items():
 #         pmx_clusters[r][c] = {}
 #     pmx_clusters[r][c][n]=v
 _password = config['proxmox']['password']
-version = '0.10.1'
+version = '0.10.2'
 starttime = None
 
 # global vars
@@ -128,7 +128,7 @@ class Foreman(multiprocessing.Process):
                 node_status = subprocess.check_output(
                     'pvesh get nodes/{}/status'.format(node), shell=True
                     )
-            except subprocess.CalledProcessError as e:
+            except subprocess.CalledProcessError:
                 self.stick.error('Unable to get status of {}'.format(node))
                 continue
             try:
@@ -442,7 +442,7 @@ class Worker(multiprocessing.Process):
         try:
             cmd = subprocess.check_output('ha-manager remove ct:{}'.format(vmid), shell=True)
             self.stick.debug("{}:restore: Removed CT from HA")
-        except subprocess.CalledProcessError as e:
+        except subprocess.CalledProcessError:
             self.stick.error("{}:restore: Unable to remove CT from HA")
         # stop container if not already stopped
         r.hset(vmid, 'msg', 'stopping container')
@@ -1428,7 +1428,7 @@ class Worker(multiprocessing.Process):
         time.sleep(5)
         try:
             cmd = subprocess.check_output(
-                'ssh {} \'rbd unmap -o force {}/{}\''.format(
+                'ssh {} \'rbd unmap -o force /dev/rbd/{}/{}\''.format(
                     node,
                     pool,
                     disk),
@@ -1439,7 +1439,7 @@ class Worker(multiprocessing.Process):
             time.sleep(10)  # Wait a bit longer, then try again
             try:
                 cmd = subprocess.check_output(
-                    'ssh {} \'rbd unmap -o force {}/{}\''.format(
+                    'ssh {} \'rbd unmap -o force /dev/rbd/{}/{}\''.format(
                         node,
                         pool,
                         disk),
