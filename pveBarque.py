@@ -44,7 +44,7 @@ for option in config.options('destinations'):
 for option in config.options('barque_storage'):
     barque_storage[option] = config.get('barque_storage', option)
 for item in config['barque_ips'].items():
-    r,c = item[0].split('.')
+    r, c = item[0].split('.')
     v = item[1]
     if r not in barque_ips:
         barque_ips[r] = {}
@@ -59,7 +59,7 @@ for item in config['barque_ips'].items():
 #         pmx_clusters[r][c] = {}
 #     pmx_clusters[r][c][n]=v
 _password = config['proxmox']['password']
-version = '0.10.2'
+version = '0.10.3'
 starttime = None
 
 # global vars
@@ -87,11 +87,13 @@ log.addHandler(fh)
 log.info('Barque Logging Initialized.')
 
 proxmox = ProxmoxAPI(_host, user='root@pam', password=_password,
-    verify_ssl=False)
+                     verify_ssl=False)
+
 
 class Foreman(multiprocessing.Process):
     stick = None
     r = None
+
     def run(self):
         r = redis.Redis(host=r_host, port=r_port, password=r_pw)
         self.stick = logging.getLogger('Barque.Foreman')
@@ -119,7 +121,7 @@ class Foreman(multiprocessing.Process):
 
     def update_master_list(self, containers):
         for key in containers:
-            r.hset('inventory',key, containers[key])
+            r.hset('inventory', key, containers[key])
 
     def get_node_utilizations(self):
         node_loads = {}
@@ -139,7 +141,6 @@ class Foreman(multiprocessing.Process):
                     'Unable to parse status json for node {}'.format(node)
                     )
                 continue
-
 
 
 class Worker(multiprocessing.Process):
@@ -186,7 +187,9 @@ class Worker(multiprocessing.Process):
                         elif task == 'destroy':
                             self.destroy(job)
                         else:
-                            self.stick.error("{} unable to determine task {}".format(self.name, task))
+                            self.stick.error(
+                                "{} unable to determine task {}".format(
+                                    self.name, task))
                     else:
                         self.stick.debug("{} lock unsuccessful, reentering queue".format(self.name))
                 # be nice to redis
@@ -507,9 +510,6 @@ class Worker(multiprocessing.Process):
                     # remove recovery copy
                     imgrm = subprocess.check_output("rbd rm {}/{}-barque".format(pool, vmdisk_current), shell=True)
                     self.stick.debug('{}:restore: Poisoned 2 - removed disaster recovery image'.format(vmid))
-                # un-stop container
-                self.proxconn.nodes(node).lxc(vmid).status.start.create()
-                self.stick.debug('{}:restore: Poisoned 2 - start container request created'.format(vmid))
                 r.hset(vmid, 'msg', 'Task successfully cancelled')
                 r.hset(vmid, 'state', 'OK')
             except:
@@ -704,7 +704,6 @@ class Worker(multiprocessing.Process):
                 cmd = subprocess.check_output(
                     "rbd mv {}/{}-barque {}/{}".format(pool, vmdisk_current, pool, vmdisk_current), shell=True)
                 print(cmd)
-                self.proxconn.nodes(node).lxc(vmid).status.start.create()
                 r.hset(vmid, 'msg', 'Task successfully cancelled')
                 r.hset(vmid, 'state', 'OK')
             except:
@@ -769,7 +768,6 @@ class Worker(multiprocessing.Process):
                 cmd = subprocess.check_output(
                     "rbd mv {}/{}-barque {}/{}".format(pool, vmdisk_current, pool, vmdisk_current), shell=True)
                 print(cmd)
-                self.proxconn.nodes(node).lxc(vmid).status.start.create()
                 r.hset(vmid, 'msg', 'Task successfully cancelled')
                 r.hset(vmid, 'state', 'OK')
             except:
@@ -795,37 +793,6 @@ class Worker(multiprocessing.Process):
                         current_conf.write(ipline)
                         continue
                     current_conf.write(line)
-
-
-        ## Disabled due to IP change conflicts
-        # start container
-        try:
-            subprocess.check_output(
-                'ssh {} \'pct start {}\''.format(node, vmid),
-                shell=True
-                )
-            self.stick.info('{}:restore: Container started'.format(vmid))
-        except subprocess.CalledProcessError:
-            self.stick.error('{}:restore: Unable to start container'
-                             ''.format(vmid))
-            r.hset(vmid, 'msg', 'Unable to start container')
-            r.hset(vmid, 'state', 'error')
-            return
-
-        # Execute ping test
-        try:
-            time.sleep(10)
-            cmd=subprocess.check_output(
-                'ssh {} \'echo \"ping -c1 -W 60 \"google.com\" | lxc-attach -n'
-                ' {} -- bash\''.format(
-                    node,
-                    vmid
-                    ),
-                shell=True)
-        except subprocess.CalledProcessError as e:
-            self.stick.error('{}:restore: Unable to ping google.com after starting container'.format(vmid))
-            r.hset(vmid, 'msg', 'error')
-            r.hset(vmid, 'state', 'error')
 
         # cleanup recovery copy
         cmd = subprocess.check_output("rbd rm {}/{}-barque".format(pool, vmdisk_current), shell=True)
@@ -1053,12 +1020,6 @@ class Worker(multiprocessing.Process):
             except:
                 r.hset(vmid, 'msg', 'Poisoned: Unable to remove the retrieved container image')
                 r.hset(vmid, 'state','error')
-            try:
-                self.proxconn.nodes(node).lxc(vmid).status.start.create()
-            except:
-                r.hset(vmid, 'msg', 'Poisoned: Unable to restart container')
-                r.hset(vmid, 'state', 'error')
-                return
             r.hset(vmid,'msg','Task successfully cancelled')
             r.hset(vmid,'state','OK')
             r.srem('joblock', vmid)
@@ -1181,12 +1142,6 @@ class Worker(multiprocessing.Process):
             except:
                 r.hset(vmid, 'msg', 'Poisoned: Unable to recover original container disk image')
                 r.hset(vmid, 'state', 'error')
-            try:
-                self.proxconn.nodes(node).lxc(vmid).status.start.create()
-            except:
-                r.hset(vmid, 'msg', 'Poisoned: Unable to restart container')
-                r.hset(vmid, 'state', 'error')
-                return
             r.hset(vmid,'msg','Task successfully cancelled')
             r.hset(vmid,'state','OK')
             r.srem('joblock', vmid)
@@ -1197,7 +1152,6 @@ class Worker(multiprocessing.Process):
 
         r.hset(vmid, 'msg', 'Cleaning up...')
         os.remove("{}{}.img".format(locations[locations.keys()[-1]], vmid))
-        self.proxconn.nodes(node).lxc(vmid).status.start.create()
         cmd = subprocess.check_output("rbd rm {}/{}-barque".format(dest_pool, dest_disk), shell=True)
         r.hset(vmid, 'state', 'OK')
         r.hset(vmid, 'msg', 'Migration complete')
@@ -1295,15 +1249,12 @@ class Worker(multiprocessing.Process):
                 disk_image),
             shell=True)
 
-        # Start Container and exit
-        self.proxconn.nodes(node).lxc(vmid).status.start.create()
+        # exit
         r.hset(vmid, 'state', 'OK')
         r.srem('joblock', vmid)
 
     def destroy(self, vmid):
-        '''
-        "Unstoppable" destroy function
-        '''
+        """'unstoppable' destroy function."""
         node = ""
         config_file = ""
         storage = ""
