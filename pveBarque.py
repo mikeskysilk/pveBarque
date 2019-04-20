@@ -59,7 +59,7 @@ for item in config['barque_ips'].items():
 #         pmx_clusters[r][c] = {}
 #     pmx_clusters[r][c][n]=v
 _password = config['proxmox']['password']
-version = '0.10.3'
+version = '0.10.4'
 starttime = None
 
 # global vars
@@ -937,8 +937,8 @@ class Worker(multiprocessing.Process):
             r.hset(vmid, 'state','error')
             r.hset(vmid, 'msg', 'unable to get pool information from proxmox')
         # get info of target barque node
-        target_ip =''
-        migration_rate='50'
+        target_ip = ''
+        migration_rate ='50'
         target_region, target_cluster_id, blank = re.split('(\d+)',target_cluster.lower())
         if target_region in barque_ips:
             if target_cluster_id in barque_ips[target_region]:
@@ -1149,6 +1149,13 @@ class Worker(multiprocessing.Process):
         ##
         ## Clean up
         ##
+
+        # TODO: Remove barque snapshot if present
+        # unprotect barque snapshot
+        cmd = subprocess.check_output('rbd snap unprotect {}/{}@barque'.format(dest_pool, dest_disk), shell=True)
+
+        # delete barque snapshot
+        cmd = subprocess.check_output('rbd snap rm {}/{}@barque'.format(dest_pool, dest_disk), shell=True)
 
         r.hset(vmid, 'msg', 'Cleaning up...')
         os.remove("{}{}.img".format(locations[locations.keys()[-1]], vmid))
@@ -1399,6 +1406,64 @@ class Worker(multiprocessing.Process):
                 self.stick.error("{}:destroy: Unable to force"
                                  " unmap disk".format(vmid))
                 time.sleep(10)  # Wait a bit longer, then try proxmox delete
+
+        ##
+        # Remove snapshots
+        ##
+        snaps = None
+        try: # Check for snapshots
+            snaps = subprocess.check_output('rbd snap ls {}/{}'.format(pool, vmdisk_current), shell=True)
+        except subprocess.CalledProcessError as e: # Unable to get snapshots
+            pass # TODO: catch error
+        if snaps: #GodILovePython.jpg
+            for snap in snaps.split('\n')[1:-1]:
+                snap_id = snap.split()[1]
+                try:
+                    subprocess.check_output('rbd snap rm {}/{}@{}'.format(pool, vmdisk_current, snap_id), shell=True)
+                except subprocess.CalledProcessError as e:
+                    # Attempt to unprotect and try removing again
+                    self.stick.debug(
+                        "{}:destory:disk_removal: Unable to remove snapshot"
+                        " {}/{}@{}, attempting to unprotect".format(
+                            vmid,
+                            pool,
+                            disk,
+                            snap_id
+                            )
+                        )
+                    try:
+                        subprocess.check_output('rbd snap unprotect {}/{}@{}'.format(pool, disk, snap_id),
+                            shell=True)
+                        self.stick.debug("{}:destroy:disk_removal: Unprotected snapshot {}/{}@{}".format(
+                            vmid,
+                            pool,
+                            disk,
+                            snap_id
+                            )
+                         )
+                    except subprocess.CalledProcessError:
+                        self.stick.error("{}:destroy:disk_removal Failed to unprotect snapshot, continuing on.".format(vmid))
+                        # Catch and release error, if there is a problem it will error after the next attempt to remove
+                    try:
+                        subprocess.check_output('rbd snap rm {}/{}@{}'.format(pool, disk, snap_id), shell=True)
+                        self.stick.debug("{}:destroy:disk_removal Removed snapshot {}".format(vmid, snap_id))
+                    except:
+                        self.stick.error("{}:destroy:disk_removal Unable to remove image snapshot {}/{}@{}".format(
+                            vmid,
+                            pool,
+                            disk,
+                            snap_id
+                            )
+                        )
+                        r.hset(vmid, 'msg', 'Unable to remove snapshots')
+                        r.hset(vmid, 'state', 'error')
+                        return
+                # continue
+            # End For loop
+        else: # No snaps found
+            self.stick.error("{}:destroy:disk_removal Removal failed, and no snaps found. Not sure what to do so crash and burn".format(vmid))
+            r.hset(vmid, 'msg', 'Unable to remove container disk, also no snapshots found')
+
 
         ##
         # Delete container via proxmox
