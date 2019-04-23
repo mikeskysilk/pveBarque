@@ -1212,9 +1212,6 @@ class Worker(multiprocessing.Process):
                                 snap_id
                                 )
                             )
-                            r.hset(vmid, 'msg', 'Unable to remove snapshots')
-                            r.hset(vmid, 'state', 'error')
-                            return
                     # continue
                 # End For loop
             else: # No snaps found
@@ -1299,7 +1296,7 @@ class Worker(multiprocessing.Process):
         r.hset(vmid, 'msg', 'Cleaning up...')
         os.remove("{}{}.img".format(locations[locations.keys()[-1]], vmid))
         cmd = subprocess.check_output("rbd rm {}/{}-barque".format(dest_pool, dest_disk), shell=True)
-        self.stick.info("{}:migrate: migration complete")
+        self.stick.info("{}:migrate: migration complete".format(vmid))
         r.hset(vmid, 'state', 'OK')
         r.hset(vmid, 'msg', 'Migration complete')
         r.srem('joblock', vmid)
@@ -1552,14 +1549,14 @@ class Worker(multiprocessing.Process):
         ##
         snaps = None
         try: # Check for snapshots
-            snaps = subprocess.check_output('rbd snap ls {}/{}'.format(pool, vmdisk_current), shell=True)
+            snaps = subprocess.check_output('rbd snap ls {}/{}'.format(pool, disk), shell=True)
         except subprocess.CalledProcessError as e: # Unable to get snapshots
             pass # TODO: catch error
         if snaps: #GodILovePython.jpg
             for snap in snaps.split('\n')[1:-1]:
                 snap_id = snap.split()[1]
                 try:
-                    subprocess.check_output('rbd snap rm {}/{}@{}'.format(pool, vmdisk_current, snap_id), shell=True)
+                    subprocess.check_output('rbd snap rm {}/{}@{}'.format(pool, disk, snap_id), shell=True)
                 except subprocess.CalledProcessError as e:
                     # Attempt to unprotect and try removing again
                     self.stick.debug(
