@@ -353,6 +353,7 @@ class Worker(multiprocessing.Process):
         cmd = subprocess.check_output('rbd snap rm {}/{}@barque'.format(pool, vmdisk), shell=True)
 
         # mark complete and unlock CTID
+        self.stick.info("{}:backup: backup complete".format(vmid))
         r.hset(vmid, 'state', 'OK')
         r.srem('joblock', vmid)
         return
@@ -433,6 +434,7 @@ class Worker(multiprocessing.Process):
             r.hset(vmid, 'state', 'error')
             r.hset(vmid, 'msg', 'unable to get storage info from backup config file')
             return
+
         # check if poisoned 1
         if r.hget(vmid, 'job') == 'poisoned':
             self.stick.debug('{}:restore: Reached Poisoned 1'.format(vmid))
@@ -963,6 +965,13 @@ class Worker(multiprocessing.Process):
         ## Perform Operations
         ##
 
+        # Remove from HA
+        try:
+            cmd = subprocess.check_output('ha-manager remove ct:{}'.format(vmid), shell=True)
+            self.stick.debug("{}:restore: Removed CT from HA")
+        except subprocess.CalledProcessError:
+            self.stick.error("{}:restore: Unable to remove CT from HA")
+
         # stop container if not already stopped
         r.hset(vmid, 'msg', 'stopping container')
         self.stick.info('{}:migrate: Checking if container is stopped'.format(vmid))
@@ -975,7 +984,7 @@ class Worker(multiprocessing.Process):
                 r.hset(vmid, 'state', 'error')
                 r.hset(vmid, 'msg', 'unable to stop container - proxmox api returned null')
                 return
-        timeout = time.time() + 60
+        timeout = time.time() + 61
         while True:  # wait for container to stop
             self.stick.debug('{}:migrate: checking if container has stopped'.format(vmid))
             stat = self.proxconn.nodes(node).lxc(vmid).status.current.get()["status"]
@@ -988,8 +997,9 @@ class Worker(multiprocessing.Process):
                 r.hset(vmid, 'state', 'error')
                 r.hset(vmid, 'msg', 'Unable to stop container - timeout')
                 return
-            time.sleep(1)
+            time.sleep(10)
 
+        # Retrieve backup file
         try:
             r.hset(vmid, 'msg', 'Fetching backup image')
             print("root@{}".format(target_ip))
@@ -1001,10 +1011,10 @@ class Worker(multiprocessing.Process):
                                                                                        locations[locations.keys()[-1]],
                                                                                        vmid), shell=True)
             # print(cmd)
-        except:
+        except subprocess.CalledProcessError:
             try:
                 os.remove("{}{}.img".format(locations[locations.keys()[-1]], vmid))
-            except:
+            except Exception:
                 r.hset(vmid, 'msg', 'migrate: Unable to remove the retrieved container image, error fetching backup image')
                 r.hset(vmid, 'state','error')
                 return
@@ -1017,7 +1027,7 @@ class Worker(multiprocessing.Process):
             self.stick.debug("{}:migrate: reached poisoned 2".format(vmid))
             try:
                 os.remove("{}{}.img".format(locations[locations.keys()[-1]], vmid))
-            except:
+            except Exception:
                 r.hset(vmid, 'msg', 'Poisoned: Unable to remove the retrieved container image')
                 r.hset(vmid, 'state','error')
             r.hset(vmid,'msg','Task successfully cancelled')
@@ -1025,6 +1035,7 @@ class Worker(multiprocessing.Process):
             r.srem('joblock', vmid)
             return
 
+        # Create a disaster recovery copy of disk image
         self.stick.info('{}:migrate: Creating disaster recovery image'.format(vmid))
         r.hset(vmid, 'msg', 'creating disaster recovery image')
         try:
@@ -1033,7 +1044,7 @@ class Worker(multiprocessing.Process):
                                                                                                         dest_pool,
                                                                                                         dest_disk),
                                                                                                         shell=True)
-        except:
+        except subprocess.CalledProcessError:
             try:
                 os.remove("{}{}.img".format(locations[locations.keys()[-1]], vmid))
             except:
@@ -1056,55 +1067,176 @@ class Worker(multiprocessing.Process):
                                                                                                      dest_pool,
                                                                                                      dest_disk))
 
-        r.hset(vmid, 'msg', 'removing container image')
-        self.stick.debug('{}:migrate: removing container image'.format(vmid))
-        timeout = time.time() + 120
-        while True:
-            if time.time() > timeout:
-                self.stick.error('{}:migrate: Unable to remove container image, timed out'.format(vmid))
-                try:
-                    os.remove("{}{}.img".format(locations[locations.keys()[-1]], vmid))
-                except:
-                    r.hset(vmid, 'msg', 'migrate: Unable to remove the retrieved container image, error removing container image')
-                    r.hset(vmid, 'state','error')
-                    return
-                try:
-                    imgrm = subprocess.check_output("rbd rm --rbd-concurrent-management-ops 20 {}/{}-barque".format(
-                        dest_pool,
-                        dest_disk),
-                        shell=True)
-                except:
-                    r.hset(vmid, 'msg', 'migrate: Unable to remove the image copy, error removing container image')
-                    r.hset(vmid, 'state','error')
-                    return
-                r.hset(vmid, 'state', 'error')
-                r.hset(vmid, 'msg', 'Unable to remove container image, timed out')
-                return
-            self.stick.debug('{}:migrate: Attempting to remove container image, looped!'.format(vmid))
-            found = False
-            try:
-                for item in self.proxconn.nodes(node).storage(dest_storage).content.get():
-                    if item['name'] == dest_disk:
-                        try:
-                            found = True
-                            self.stick.debug(
-                                '{}:migrate: container image found, attempting to remove (loop)'.format(vmid))
-                            self.proxconn.nodes(node).storage(dest_storage).content(dest_disk).delete()
-                        except:
-                            pass
-                if not found:
-                    self.stick.debug('{}:migrate: container image not found, continuing with restore'.format(vmid))
-                    break  # Exit loop if vmdisk not found (i.e. it's deleted)
-            except:
-                self.stick.error('{}:migrate: unable to retrieve list of storage from Proxmox, trying again.')
+        # Remove container image
+        # Helper functions which will be used repeatedly
+        def unmap_rbd(self, force=False):
+            '''
+            Uses rbd unmap to unmap the rbd device, over ssh to the target node.
+            Accepts boolean argument "force" to include the -o force flag on if True, absent if False
+            Returns True if the unmap command was successful.
+            '''
             time.sleep(5)
+            if force:
+                try:
+                    cmd = subprocess.check_output(
+                        'ssh {} \'rbd unmap -o force {}/{}\''.format(node, dest_pool, dest_disk), shell=True
+                        )
+                except subprocess.CalledProcessError as e:
+                    self.stick.error("{}:migrate:unmapRBD: Unable to force unmap disk".format(vmid))
+                    return False
+            else:
+                try:
+                    cmd = subprocess.check_output(
+                        'ssh {} \'rbd unmap {}/{}\''.format(node, dest_pool, dest_disk), shell=True
+                        )
+                except subprocess.CalledProcessError as e:
+                    self.stick.error("{}:migrate:unmapRBD: Unable to unmap disk, probably still in use".format(vmid))
+                    return False
+            return True
+        def rm_vmdisk(self):
+            '''
+            Uses rbd rm to remove the disk image.
+            Returns True if the rm command was successful.
+            '''
+            time.sleep(5)
+            try:
+                cmd = subprocess.check_output('rbd rm {}/{}'.format(dest_pool, dest_disk), shell=True)
+            except subprocess.CalledProcessError as e:
+                self.stick.error('{}:migrate:rm_vmdisk Failed to remove disk with rbd rm'.format(vmid))
+                return False
+            return True
 
+        # Wait some time for everything to settle down before surgery
+        time.sleep(10)
+        # Check if storage exists
+        exists = True
+        try:
+            subprocess.check_output('rbd info {}/{}'.format(dest_pool, dest_disk), shell=True)
+        except subprocess.CalledProcessError as e:
+            exists = False
+            self.stick.debug('{}:migrate: Disk image not present on first pass'.format(vmid))
+
+        # Begin process of removing disk
+        if exists:
+            if rm_vmdisk(self):
+                exists = False              # Proceed
+            else:                           # Unmap routine
+                if unmap_rbd(self):
+                    if rm_vmdisk(self):
+                        exists = False      # Proceed
+                else:  # Unable to unmap, check if CT is stopped
+                    try:
+                        cmd = subprocess.check_output(
+                            'ssh {} \'pct status {}\''.format(node, vmid),
+                            shell=True)
+                        if cmd.strip('\n').split(' ')[1] == "running":
+                            try:
+                                cmd = subprocess.check_output(
+                                    'ssh {} \'pct stop {}\''.format(node, vmid),
+                                    shell=True)
+                                time.sleep(30)
+                            except subprocess.CalledProcessError:
+                                self.stick.debug(
+                                    '{}:migrate:disk_removal: Unable to stop '
+                                    'container'.format(vmid))
+                            if unmap_rbd(self):
+                                if rm_vmdisk(self):
+                                    exists = False
+                                # else check for snapshots routine
+                            else:
+                                time.sleep(30)
+                                if unmap_rbd(self, True):
+                                    if rm_vmdisk(self):
+                                        exists = False
+                                    # else check for snapshots routine
+                                else:  # holy fuck how did that not work??
+                                    r.hset(vmid, 'msg', 'Error unmapping rbd')
+                                    r.hset(vmid, 'state', 'error')
+                                    return
+                        else:   # assume container is stopped
+                                # or stopped in error state
+                            time.sleep(30)
+                            if unmap_rbd(self,True):
+                                if rm_vmdisk(self):
+                                    exists = False
+                                # else check for snapshots routine
+                            else: # holy fuck how did that not work??
+                                r.hset(vmid, 'msg', 'Error unmapping rbd')
+                                r.hset(vmid, 'state', 'error')
+                                return
+                    except subprocess.CalledProcessError as e:
+                        self.stick.debug('{}:migrate:disk_removal: Unable to get status of ctid, hoping that it\'s off.'.format(vmid))
+        if exists: # Check for snapshots routine
+            snaps = None
+            try: # Check for snapshots
+                snaps = subprocess.check_output('rbd snap ls {}/{}'.format(dest_pool, dest_disk), shell=True)
+            except subprocess.CalledProcessError as e: # Unable to get snapshots
+                self.stick.debug('{}:migrate: unable to check for disk snapshots - command failed'.format(vmid))
+            if snaps: 
+                for snap in snaps.split('\n')[1:-1]:
+                    snap_id = snap.split()[1]
+                    try:
+                        subprocess.check_output('rbd snap rm {}/{}@{}'.format(dest_pool, dest_disk, snap_id), shell=True)
+                    except subprocess.CalledProcessError as e:
+                        # Attempt to unprotect and try removing again
+                        self.stick.debug(
+                            "{}:migrate:disk_removal: Unable to remove snapshot"
+                            " {}/{}@{}, attempting to unprotect".format(
+                                vmid,
+                                dest_pool,
+                                dest_disk,
+                                snap_id
+                                )
+                            )
+                        try:
+                            subprocess.check_output('rbd snap unprotect {}/{}@{}'.format(dest_pool, dest_disk, snap_id),
+                                shell=True)
+                            self.stick.debug("{}:migrate:disk_removal: Unprotected snapshot {}/{}@{}".format(
+                                vmid,
+                                dest_pool,
+                                dest_disk,
+                                snap_id
+                                )
+                             )
+                        except subprocess.CalledProcessError:
+                            self.stick.error("{}:migrate:disk_removal Failed to unprotect snapshot, continuing on.".format(vmid))
+                            # Catch and release error, if there is a problem it will error after the next attempt to remove
+                        try:
+                            subprocess.check_output('rbd snap rm {}/{}@{}'.format(dest_pool, dest_disk, snap_id), shell=True)
+                            self.stick.debug("{}:migrate:disk_removal Removed snapshot {}".format(vmid, snap_id))
+                        except:
+                            self.stick.error("{}:migrate:disk_removal Unable to remove image snapshot {}/{}@{}".format(
+                                vmid,
+                                dest_pool,
+                                dest_disk,
+                                snap_id
+                                )
+                            )
+                            r.hset(vmid, 'msg', 'Unable to remove snapshots')
+                            r.hset(vmid, 'state', 'error')
+                            return
+                    # continue
+                # End For loop
+            else: # No snaps found
+                self.stick.error("{}:migrate:disk_removal Removal failed, and no snaps found. Not sure what to do so crash and burn".format(vmid))
+                r.hset(vmid, 'msg', 'Unable to remove container disk, also no snapshots found')
+        if exists:
+            if rm_vmdisk(self):
+                exists = False
+            else:
+                # Looks like we got a problem.
+                r.hset(vmid, 'msg', 'Error removing disk image')
+                r.hset(vmid, 'state', 'error')
+                return
+
+        # Import the migrated disk image
         try:
             r.hset(vmid, 'msg', 'Importing disk image')
             cmd = subprocess.check_output(
                 "rbd import --export-format 2 {}{}.img {}/{}".format(locations[locations.keys()[-1]], vmid, dest_pool,
                                                                     dest_disk), shell=True)
             #print(cmd)
+            self.stick.info("{}:migrate: successfully imported disk image".format(vmid))
         except:
             try:
                 os.remove("{}{}.img".format(locations[locations.keys()[-1]], vmid))
@@ -1113,7 +1245,9 @@ class Worker(multiprocessing.Process):
                 r.hset(vmid, 'state','error')
                 return
             try:
-                imgrm = subprocess.check_output("rbd rm --rbd-concurrent-management-ops 20 {}/{}-barque".format(
+                imgrm = subprocess.check_output("rbd mv {}/{}-barque {}/{}".format(
+                    dest_pool,
+                    dest_disk,
                     dest_pool,
                     dest_disk),
                     shell=True)
@@ -1150,16 +1284,22 @@ class Worker(multiprocessing.Process):
         ## Clean up
         ##
 
-        # TODO: Remove barque snapshot if present
-        # unprotect barque snapshot
-        cmd = subprocess.check_output('rbd snap unprotect {}/{}@barque'.format(dest_pool, dest_disk), shell=True)
-
         # delete barque snapshot
-        cmd = subprocess.check_output('rbd snap rm {}/{}@barque'.format(dest_pool, dest_disk), shell=True)
+        try:
+            cmd = subprocess.check_output('rbd snap unprotect {}/{}@barque'.format(dest_pool, dest_disk), shell=True)
+            self.stick.debug('{}:migrate: unprotected barque snapshot'.format(vmid))
+        except subprocess.CalledProcessError as e:
+            self.stick.error('{}:migrate: Unable to unprotect snapshot, assuming already unprotected'.format(vmid))
+        try:
+            cmd = subprocess.check_output('rbd snap rm {}/{}@barque'.format(dest_pool, dest_disk), shell=True)
+            self.stick.debug('{}:migrate: removed barque snapshot'.format(vmid))
+        except subprocess.CalledProcessError as e:
+            self.stick.debug('{}:migrate: unable to remove barque snapshot, continuing anyway'.format(vmid))
 
         r.hset(vmid, 'msg', 'Cleaning up...')
         os.remove("{}{}.img".format(locations[locations.keys()[-1]], vmid))
         cmd = subprocess.check_output("rbd rm {}/{}-barque".format(dest_pool, dest_disk), shell=True)
+        self.stick.info("{}:migrate: migration complete")
         r.hset(vmid, 'state', 'OK')
         r.hset(vmid, 'msg', 'Migration complete')
         r.srem('joblock', vmid)
