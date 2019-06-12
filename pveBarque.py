@@ -59,7 +59,7 @@ for item in config['barque_ips'].items():
 #         pmx_clusters[r][c] = {}
 #     pmx_clusters[r][c][n]=v
 _password = config['proxmox']['password']
-version = '0.10.4'
+version = '0.11.0'
 starttime = None
 
 # global vars
@@ -113,11 +113,20 @@ class Foreman(multiprocessing.Process):
                     'ssh {} \"awk \'{{ print \$8 }}\' /proc/net/unix | '
                     'grep /var/lib/lxc/.*/command\"'.format(node),
                     shell=True).split('\n')[:-1]
+                # vmcount = subprocess.check_output("ssh {} \"ls -l /var/run/qemu-server/*.pid | wc -l\"", shell=True).strip()
             except subprocess.CalledProcessError:
                 containers[node] = "0"
                 continue
-            containers[node] = len(socket_list)
+            containers[node] = len(socket_list) + self.get_vms_count(node)
         return containers
+
+    def get_vms_count(self, node):
+        vms = 0
+        try:
+            vms = len(subprocess.check_output("ssh {} \"ls -l /var/run/qemu-server/ | grep vnc\"".format(node), shell=True).split('\n')[:-1])
+        except subprocess.CalledProcessError:
+            vms = 0
+        return vms
 
     def update_master_list(self, containers):
         for key in containers:
