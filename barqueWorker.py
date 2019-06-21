@@ -8,6 +8,7 @@ import time
 import os
 import subprocess
 import configparser
+import barqueTarget
 from shutil import copyfile
 from proxmoxer import ProxmoxAPI
 from datetime import datetime
@@ -65,6 +66,7 @@ class Worker(multiprocessing.Process):
         return
 
     def backup(self, vmid):
+        
         storage = None
         vmdisk = None
         destination = r.hget(vmid, 'dest')
@@ -86,6 +88,7 @@ class Worker(multiprocessing.Process):
                 r.hset(vmid, 'msg', '{} storage destination is offline, unable to recover')
                 r.hset(vmid, 'state', 'error')
                 return
+        target = barqueTarget.Target(vmid, "backup", 0, "default", "test", self.proxconn)
         r.hset(vmid, 'state', 'active')
         # vmdisk = 'vm-{}-disk-1'.format(vmid)
         timestamp = datetime.strftime(datetime.utcnow(), "_%Y-%m-%d_%H-%M-%S")
