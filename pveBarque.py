@@ -6,6 +6,7 @@ import subprocess
 import logging
 import barqueForeman
 import barqueWorker
+import re
 from proxmoxer import ProxmoxAPI
 from logging import handlers
 from datetime import datetime
@@ -54,7 +55,7 @@ for item in config['barque_ips'].items():
 #         pmx_clusters[r][c] = {}
 #     pmx_clusters[r][c][n]=v
 _password = config['proxmox']['password']
-version = '0.10.4'
+version = '0.12.6'
 starttime = None
 
 # global vars
@@ -72,9 +73,9 @@ log = logging.getLogger('Barque')
 log.setLevel(logging.DEBUG)
 ch = logging.StreamHandler()
 ch.setLevel(logging.DEBUG)
-fh = logging.handlers.WatchedFileHandler('/var/log/barque.log')
+fh = logging.handlers.WatchedFileHandler('/opt/barque/barque.log')
 fh.setLevel(logging.INFO)
-fm = logging.Formatter('%(asctime)s : %(levelname)s : %(name)s -- %(message)s')
+fm = logging.Formatter('%(asctime)s:%(levelname)s:%(name)s:%(message)s')
 ch.setFormatter(fm)
 fh.setFormatter(fm)
 log.addHandler(ch)
@@ -123,6 +124,39 @@ class Backup(Resource):
 
         return {'status': "backup job created for CTID {}".format(vmid)}, 202
 
+class Backupv2(Resource):
+    @auth.login_required
+    def post(self, vmid):
+        dest = ""
+        if not checkConfv2(vmid):
+            return {'error': "{} is not a valid VMID".format(vmid)}, 400
+        # clear error and try again if retry flag in request args
+        if 'retry' in request.args and r.hget(vmid, 'state') == 'error':
+            r.srem('joblock', vmid)
+            log.debug("Clearing error state for ctid: {}".format(vmid))
+        # handle destination setting
+        if 'dest' in request.args:
+            result, response, err = checkDest(request.args['dest'])
+            if result:
+                dest = locations[request.args['dest']]
+            else:
+                return response, err
+        else:
+            result, response, err = checkDest(locations.keys()[-1])
+            if result:
+                dest = locations[locations.keys()[-1]]
+            else:
+                return response, err
+
+        if str(vmid) in r.smembers('joblock'):
+            return {'error': "VMID locked, another operation is in progress for container: {}".format(vmid),
+                    'status': r.hget(vmid, 'state'), 'job': r.hget(vmid, 'job')}, 409
+        r.hset(vmid, 'job', 'backup')
+        r.hset(vmid, 'dest', dest)
+        r.hset(vmid, 'state', 'enqueued')
+        r.hset(vmid, 'msg', '')
+        r.sadd('joblock', vmid)
+        return {'status': "backup job created for VMID {}".format(vmid)}, 202
 
 class BackupAll(Resource):
     @auth.login_required
@@ -207,6 +241,55 @@ class Restore(Resource):
 
         return {'status': "restore job created for CTID {}".format(vmid)}, 202
 
+class Restorev2(Resource):
+    @auth.login_required
+    def post(self, vmid):
+        path = None
+        # handle destination setting
+        if 'dest' in request.args:
+            result, response, err = checkDest(request.args['dest'])
+            if result:
+                path = locations[request.args['dest']]
+            else:
+                return response, err
+        else:
+            result, response, err = checkDest(locations.keys()[-1])
+            if result:
+                path = locations[locations.keys()[-1]]
+            else:
+                return response, err
+        # check if file specified
+        if 'file' not in request.args:
+            return {'error': 'Resource requires a file argument'}, 400
+        filename = os.path.splitext(request.args['file'])[0]
+        if not filename.split('-')[1] == str(vmid):
+            return {'error': 'File name does not match VMID'}, 400
+        fileimg = "".join([path, filename, ".lz4"])
+        fileconf = "".join([path, filename, ".conf"])
+
+        # catch if container does not exist
+        if not checkConfv2(vmid):
+            return {'error': "{} is not a valid CTID"}, 400
+        # check if backup and config files exist
+        if not os.path.isfile(fileimg) and not os.path.isfile(fileconf):
+            return {'error': "unable to proceed, backup file or config file (or both) does not exist"}, 400
+            # clear error and try again if retry flag in request args
+        if 'retry' in request.args and r.hget(vmid, 'state') == 'error':
+            r.srem('joblock', vmid)
+            log.debug("Clearing error state for ctid: {}".format(vmid))
+        if str(vmid) in r.smembers('joblock'):
+            return {'error': "VMID locked, another operation is in progress for container: {}".format(vmid)}, 409
+
+        r.hset(vmid, 'job', 'restore')
+        r.hset(vmid, 'file', filename)
+        r.hset(vmid, 'worker', '')
+        r.hset(vmid, 'msg', '')
+        r.hset(vmid, 'dest', path)
+        r.hset(vmid, 'state', 'enqueued')
+        r.sadd('joblock', vmid)
+
+        return {'status': "restore job created for VMID {}".format(vmid)}, 202
+
 
 class ListAllBackups(Resource):
     @auth.login_required
@@ -256,6 +339,24 @@ class ListBackups(Resource):
         files = sorted(os.path.basename(f) for f in glob("".join([path, "vm-{}-disk*.lz4".format(vmid)])))
         return {'backups': files}
 
+class ListBackupsv2(Resource):
+    @auth.login_required
+    def get(self, vmid):
+        path = None
+        if 'dest' in request.args:
+            result, response, err = checkDest(request.args['dest'])
+            if result:
+                path = locations[request.args['dest']]
+            else:
+                return response, err
+        else:
+            result, response, err = checkDest(locations.keys()[-1])
+            if result:
+                path = locations[locations.keys()[-1]]
+            else:
+                return response, err
+        files = sorted(os.path.basename(f) for f in glob("".join([path, "vm-{}-disk*.lz4".format(vmid)])))
+        return {'backups': files}
 
 class DeleteBackup(Resource):
     @auth.login_required
@@ -521,7 +622,7 @@ class Migrate(Resource):
         if 'file' not in request.args:
             return {'error': 'Resource requires a file argument'}, 400
         # Check if destination container does not exist
-        if not checkConf(vmid):
+        if not checkConfv2(vmid):
             return {'error': "{} is not a valid CTID"}, 400
         # Check if cluster is specified
         if 'cluster' not in request.args:
@@ -534,6 +635,72 @@ class Migrate(Resource):
         if str(vmid) in r.smembers('joblock'):
             return {'error': "VMID locked, another operation is in progress for container: {}".format(vmid)}, 409
 
+        r.hset(vmid, 'job', 'migrate')
+        r.hset(vmid, 'file', request.args['file'])
+        r.hset(vmid, 'worker', '')
+        r.hset(vmid, 'msg', '')
+        r.hset(vmid, 'target_cluster', request.args['cluster'])
+        r.hset(vmid, 'state', 'enqueued')
+        r.sadd('joblock', vmid)
+
+        return {'status': "migrate job created for CTID {}".format(vmid)}, 202
+
+class MigrateV2(Resource):
+    @auth.login_required
+    def post(self, vmid):
+        # Check if file is specified
+        if 'file' not in request.args:
+            return {'error': 'Resource requires a file argument'}, 400
+        # Check if destination container does not exist
+        if not checkConfv2(vmid):
+            return {'error': "{} is not a valid CTID"}, 400
+        # Check if cluster is specified
+        if 'cluster' not in request.args:
+            return {'error': 'Resource requires a cluster argument (dtla01, dtla02, dtla03, dtla04, ny01)'}, 400
+        # clear error and try again if retry flag in request args
+        if 'retry' in request.args and r.hget(vmid, 'state') == 'error':
+            r.srem('joblock', vmid)
+            log.debug("Clearing error state for ctid: {}".format(vmid))
+        # Check if container is available
+        if str(vmid) in r.smembers('joblock'):
+            return {'error': "VMID locked, another operation is in progress for container: {}".format(vmid)}, 409
+
+        # handle destination setting
+        path = None
+        if 'dest' in request.args:
+            result, response, err = checkDest(request.args['dest'])
+            if result:
+                path = locations[request.args['dest']]
+            else:
+                return response, err
+        else:
+            result, response, err = checkDest(locations.keys()[-1])
+            if result:
+                path = locations[locations.keys()[-1]]
+            else:
+                return response, err
+
+        #determine remote host IP
+
+        #determine remote host path
+
+        # get info of target barque node
+        target_ip = ''
+        target_region, target_cluster_id, blank = re.split('(\d+)',request.args['cluster'].lower())
+        if target_region in barque_ips:
+            if target_cluster_id in barque_ips[target_region]:
+                target_ip = barque_ips[target_region][target_cluster_id]
+            else:
+                r.hset(vmid, 'state','error')
+                r.hset(vmid,'msg','cluster number not configured')
+        else:
+            r.hset(vmid, 'state', 'error')
+            r.hset(vmid, 'msg', 'Cluster region not configured')
+        target_path = barque_storage[request.args['cluster'].lower()]
+
+        r.hset(vmid, 'dest', path)
+        r.hset(vmid, 'target_ip', target_ip)
+        r.hset(vmid, 'target_path', target_path)
         r.hset(vmid, 'job', 'migrate')
         r.hset(vmid, 'file', request.args['file'])
         r.hset(vmid, 'worker', '')
@@ -564,18 +731,34 @@ class Inventory(Resource):
             hasArgs = True
         if hasArgs:
             return result, 200
-        container_count = {}
+        total_count = {}
+        if 'detailed' in request.args:
+            nodes = {}
+            aggregate = {}
+            aggregate["lxc"] = 0
+            aggregate["vm"] = 0
+            aggregate["total"] = 0
+            for node in os.listdir('/etc/pve/nodes'):
+                stats = {}
+                stats["lxc"] = int(r.hget('inv_ct', node))
+                stats["vm"] = int(r.hget('inv_vm', node))
+                stats["total"] = stats["lxc"] + stats["vm"]
+                nodes[node] = stats
+                aggregate["lxc"] += stats["lxc"]
+                aggregate["vm"] += stats["vm"]
+                aggregate["total"] += stats["total"]
+            return {"nodes": nodes, "aggregate": aggregate}, 200
         for node in os.listdir('/etc/pve/nodes'):
             try:
-                container_count[node] = r.hget('inventory', node)
+                total_count[node] = int(r.hget('inv_ct', node)) + int(r.hget('inv_vm', node))
             except:
                 continue
-        return {'total': self.get_total(), 'nodes': container_count}, 200
+        return {'total': self.get_total(), 'nodes': total_count}, 200
 
     def get_total(self):
         total = 0
         for node in os.listdir('/etc/pve/nodes'):
-            total = total + int(r.hget('inventory', node))
+            total = total + int(r.hget('inv_ct', node)) + int(r.hget('inv_vm', node))
         return total
 
 
@@ -604,12 +787,36 @@ class Destroy(Resource):
 
         return {'status': "Deletion requested for {}".format(vmid)}, 202
 
+class Destroyv2(Resource):
+    @auth.login_required
+    def post(self, vmid):
+        # catch if container does not exist
+        if not checkConfv2(vmid):
+            return {'error': "{} is not a valid CTID".format(vmid)}, 400
+        # clear error and try again if retry flag in request args
+        if 'retry' in request.args and r.hget(vmid, 'state') == 'error':
+            r.srem('joblock', vmid)
+            log.debug("Clearing error state")
+        # Check if container is available
+        if str(vmid) in r.smembers('joblock'):
+            return {'error': "VMID locked, another operation is in progress "
+                    "for container: {}".format(vmid)}, 409
+
+        r.hset(vmid, 'job', 'destroy')
+        r.hset(vmid, 'file', '')
+        r.hset(vmid, 'worker', '')
+        r.hset(vmid, 'msg', 'destroying')
+        r.hset(vmid, 'target_cluster', '')
+        r.hset(vmid, 'state', 'enqueued')
+        r.sadd('joblock', vmid)
+
+        return {'status': "Deletion requested for {}".format(vmid)}, 202
 
 api.add_resource(ListAllBackups, '/barque/')
 api.add_resource(ListBackups, '/barque/<int:vmid>')
-api.add_resource(Backup, '/barque/<int:vmid>/backup')
+api.add_resource(Backupv2, '/barque/<int:vmid>/backup')
 api.add_resource(BackupAll, '/barque/all/backup')
-api.add_resource(Restore, '/barque/<int:vmid>/restore')
+api.add_resource(Restorev2, '/barque/<int:vmid>/restore')
 api.add_resource(DeleteBackup, '/barque/<int:vmid>/delete')
 api.add_resource(Status, '/barque/<int:vmid>/status')
 api.add_resource(AllStatus, '/barque/all/status')
@@ -618,9 +825,10 @@ api.add_resource(ClearQueue, '/barque/all/clear')
 api.add_resource(CleanSnaps, '/barque/all/clean')
 api.add_resource(Poison, '/barque/<int:vmid>/poison')
 api.add_resource(AVtoggle, '/barque/avtoggle')
-api.add_resource(Migrate, '/barque/<int:vmid>/migrate')
+api.add_resource(MigrateV2, '/barque/<int:vmid>/migrate')
 api.add_resource(Inventory, '/barque/count')
-api.add_resource(Destroy, '/barque/<int:vmid>/destroyContainer')
+api.add_resource(Destroyv2, '/barque/<int:vmid>/destroyContainer')
+#api.add_resource(Destroyv2, '/barque/<int:vmid>/destroy')
 
 
 def sanitize():
@@ -637,6 +845,21 @@ def verify(username, password):
         return False
     return admin_auth.get(username) == password
 
+def checkConfv2(vmid):
+    """Sets host and resource type in redis database, returns True if exists."""
+    config_file = ""
+    config_target = "{}.conf".format(vmid)
+    nodelist = os.listdir('/etc/pve/nodes')
+    for node in os.listdir('/etc/pve/nodes'):
+        if config_target in os.listdir('/etc/pve/nodes/{}/lxc'.format(node)):
+            r.hset(vmid, "host", node)
+            r.hset(vmid, "type", "ct")
+            return True
+        if config_target in os.listdir('/etc/pve/nodes/{}/qemu-server'.format(node)):
+            r.hset(vmid, "host", node)
+            r.hset(vmid, "type", "vm")
+            return True
+    return False
 
 def checkConf(vmid):
     # catch if container does not exist
@@ -685,10 +908,10 @@ def convertAVLocks(node):
 
 if __name__ == '__main__':
     starttime = datetime.utcnow().replace(microsecond=0)
-    r = redis.Redis(host=r_host, port=r_port, password=r_pw)
+    r = redis.Redis(host=r_host, port=r_port, password=r_pw, db=0)
     sanitize()
     log.info("redis connection successful")
-    f = barqueForeman.Foreman(r_host, r_port, r_pw)
+    f = barqueForeman.Foreman(r_host, r_port, r_pw, 0)
     f.start()
     log.debug("Foreman started")
     for i in range(minions):
@@ -698,6 +921,7 @@ if __name__ == '__main__':
                                 r_host,
                                 r_port,
                                 r_pw,
+                                0,
                                 barque_ips,
                                 barque_storage,
                                 locations)
