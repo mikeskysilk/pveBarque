@@ -118,29 +118,19 @@ class Worker(multiprocessing.Process):
             try:
                 storage, vmdisk = parser['root']['rootfs'].split(',')[
                                                                  0].split(':')
-            except Exception as e:
+            except Exception:
                 #print(e)
                 r.hset(vmid, 'state', 'error')
                 r.hset(vmid, 'msg', 'unable to get storage info from config file')
                 return True, details
         if details['resource_type'] == "vm":
             try:
-                storage, vmdisk = parser['root']['scsi0'].split(',')[
-                                                                0].split(':')
+                storage, vmdisk = parser['root'][parser['root']['bootdisk']].split(',')[0].split(':')
             except Exception as e:
                 #print(e)
-                try:
-                    storage, vmdisk = parser['root']['virtio0'].split(',')[0].split(':')
-                except Exception as e:
-                    #print(e)
-                    try:
-                        storage, vmdisk = parser['root']['ide1'].split(',')[0].split(':')
-                        # Must be ide1 because the iso is mapped to ide0
-                    except Exception as e:
-                        #print(e)
-                        r.hset(vmid, 'state', 'error')
-                        r.hset(vmid, 'msg', 'unable to get storage info from config file')
-                        return True, details
+                r.hset(vmid, 'state', 'error')
+                r.hset(vmid, 'msg', 'unable to get storage info from config file')
+                return True, details
 
         for store in self.parseStorage():
             if store['name'] == storage:
