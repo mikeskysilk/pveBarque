@@ -104,7 +104,7 @@ class Target(object):
             except:
                 return True, "unable to unprotect snapshot"
             return False, "snapshot unprotected"
-    
+
     def remove_recovery_snapshots(self):
         try:
             subprocess.check_output(
@@ -280,7 +280,7 @@ class Target(object):
     def import_backup_image(self):
         try:
             subprocess.check_output("rbd import --export-format=2 {}{}.img {}/{}".format(
-                self.destination, self.file_target, self.ceph_pool, self.ceph_vmdisk), shell=True)
+                self.destination, self.vmid, self.ceph_pool, self.ceph_vmdisk), shell=True)
         except:
             return True, "unable to import disk image to ceph"
         return False, "successfully imported disk image"
@@ -377,8 +377,8 @@ class Target(object):
         used to preserve snapshots. Additionally, this will overwrite all "net0"
         lines in a container's config file with whatever the current IP address
         is, in order to prevent an old backup from clobbering someone else's IP.
-        This function reads the backup's config file and writes each line to the 
-        current config file line-by-line. 
+        This function reads the backup's config file and writes each line to the
+        current config file line-by-line.
         """
         if self.resource_type == "ct":
             current_config = '/etc/pve/nodes/{}/lxc/{}.conf'.format(self.host, self.vmid)

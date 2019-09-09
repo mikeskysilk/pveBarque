@@ -73,6 +73,8 @@ class Worker(multiprocessing.Process):
             for line in file:
                 if line.startswith('\n'):
                     continue
+                if line.startswith('#'):
+                    continue
                 if not line.startswith('\t') and not line.startswith(' '):
                     current = current + 1
                     #print(line)
@@ -475,7 +477,7 @@ class Worker(multiprocessing.Process):
             details['resource_type'],   #
             details['host'],            #
             details['destination'],     #
-            vmid,     #
+            details['file_target'],     #
             details['proxconn'],        #
             details['ceph_pool'],       #
             details['ceph_vmdisk'],     #
