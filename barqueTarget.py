@@ -265,13 +265,13 @@ class Target(object):
         if not undo:
             try:
                 subprocess.check_output("lz4 -d {}{}.lz4 {}{}.img".format(
-                    self.destination, self.file_target, self.destination, self.file_target), shell=True)
+                    self.destination, self.file_target, self.destination, self.vmid), shell=True)
             except:
                 return True, "unable to extract disk image"
             return False, "extracted disk image"
         else:
             try:
-                os.remove("".join((self.destination, self.file_target, ".img")))
+                os.remove("".join((self.destination, self.vmid, ".img")))
             except:
                 return True, "unable to remove image"
             return False, "extracted image removed"

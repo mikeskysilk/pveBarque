@@ -28,17 +28,18 @@ path = config['settings']['path']  # Destination path for backups,
                                     # terminating / required
 pool = config['settings']['pool']   # Ceph RBD pool, terminating / required.
                                     # Leave empty for default
+local_cluster = config['settings']['local']
 minions = int(config['settings']['workers'])  # number of worker processes
 r_host = config['redis']['host']  # Redis server host
 r_port = int(config['redis']['port'])  # Redis server port
 r_pw = config['redis']['password']  # Redis server password
-locations = {}  # backup storage destinations
 barque_storage = {}
 barque_ips = {}
-for option in config.options('destinations'):
-    locations[option] = config.get('destinations', option)
 for option in config.options('barque_storage'):
-    barque_storage[option] = config.get('barque_storage', option)
+    barque_storage[option] = {}
+    conf_locations = config.get('barque_storage', option).split(',')
+    for location in conf_locations:
+        barque_storage[option][location.split(':')[0]] = location.split(':')[1]
 for item in config['barque_ips'].items():
     r, c = item[0].split('.')
     v = item[1]
@@ -55,7 +56,7 @@ for item in config['barque_ips'].items():
 #         pmx_clusters[r][c] = {}
 #     pmx_clusters[r][c][n]=v
 _password = config['proxmox']['password']
-version = '0.12.8'
+version = '0.12.10'
 starttime = None
 
 # global vars
@@ -86,44 +87,6 @@ proxmox = ProxmoxAPI(_host, user='root@pam', password=_password,
                      verify_ssl=False)
 
 
-class Backup(Resource):
-    @auth.login_required
-    def post(self, vmid):
-        dest = ""
-        # catch if container does not exist
-        if not checkConf(vmid):
-            return {'error': "{} is not a valid CTID".format(vmid)}, 400
-        # clear error and try again if retry flag in request args
-        if 'retry' in request.args and r.hget(vmid, 'state') == 'error':
-            r.srem('joblock', vmid)
-            log.debug("Clearing error state")
-        # handle destination setting
-        if 'dest' in request.args:
-            result, response, err = checkDest(request.args['dest'])
-            if result:
-                dest = locations[request.args['dest']]
-            else:
-                return response, err
-        else:
-            result, response, err = checkDest(locations.keys()[-1])
-            if result:
-                dest = locations[locations.keys()[-1]]
-            else:
-                return response, err
-        if str(vmid) in r.smembers('joblock'):
-            return {'error': "VMID locked, another operation is in progress for container: {}".format(vmid),
-                    'status': r.hget(vmid, 'state'), 'job': r.hget(vmid, 'job')}, 409
-        else:
-            r.hset(vmid, 'job', 'backup')
-            r.hset(vmid, 'file', '')
-            r.hset(vmid, 'worker', '')
-            r.hset(vmid, 'msg', '')
-            r.hset(vmid, 'state', 'enqueued')
-            r.hset(vmid, 'dest', dest)
-            r.sadd('joblock', vmid)
-
-        return {'status': "backup job created for CTID {}".format(vmid)}, 202
-
 class Backupv2(Resource):
     @auth.login_required
     def post(self, vmid):
@@ -138,13 +101,13 @@ class Backupv2(Resource):
         if 'dest' in request.args:
             result, response, err = checkDest(request.args['dest'])
             if result:
-                dest = locations[request.args['dest']]
+                dest = barque_storage[local_cluster][request.args['dest']]
             else:
                 return response, err
         else:
-            result, response, err = checkDest(locations.keys()[-1])
+            result, response, err = checkDest('default')
             if result:
-                dest = locations[locations.keys()[-1]]
+                dest = barque_storage[local_cluster]['default']
             else:
                 return response, err
 
@@ -167,13 +130,13 @@ class BackupAll(Resource):
         if 'dest' in request.args:
             result, response, err = checkDest(request.args['dest'])
             if result:
-                dest = locations[request.args['dest']]
+                dest = barque_storage[request.args['dest']]
             else:
                 return response, err
         else:
-            result, response, err = checkDest(locations.keys()[-1])
+            result, response, err = checkDest('default')
             if result:
-                dest = locations[locations.keys()[-1]]
+                dest = barque_storage[local_cluster]['default']
             else:
                 return response, err
         response = []
@@ -195,52 +158,6 @@ class BackupAll(Resource):
                 response.append({vmid: {"status": "enqueued", "message": "Backup job added to queue"}})
         return response
 
-
-class Restore(Resource):
-    @auth.login_required
-    def post(self, vmid):
-        path = None
-        # handle destination setting
-        if 'dest' in request.args:
-            result, response, err = checkDest(request.args['dest'])
-            if result:
-                path = locations[request.args['dest']]
-            else:
-                return response, err
-        else:
-            result, response, err = checkDest(locations.keys()[-1])
-            if result:
-                path = locations[locations.keys()[-1]]
-            else:
-                return response, err
-        # check if file specified
-        if 'file' not in request.args:
-            return {'error': 'Resource requires a file argument'}, 400
-        filename = os.path.splitext(request.args['file'])[0]
-        if not filename.split('-')[1] == str(vmid):
-            return {'error': 'File name does not match VMID'}, 400
-        fileimg = "".join([path, filename, ".lz4"])
-        fileconf = "".join([path, filename, ".conf"])
-
-        # catch if container does not exist
-        if not checkConf(vmid):
-            return {'error': "{} is not a valid CTID"}, 400
-        # check if backup and config files exist
-        if not os.path.isfile(fileimg) and not os.path.isfile(fileconf):
-            return {'error': "unable to proceed, backup file or config file (or both) does not exist"}, 400
-        if str(vmid) in r.smembers('joblock'):
-            return {'error': "VMID locked, another operation is in progress for container: {}".format(vmid)}, 409
-
-        r.hset(vmid, 'job', 'restore')
-        r.hset(vmid, 'file', filename)
-        r.hset(vmid, 'worker', '')
-        r.hset(vmid, 'msg', '')
-        r.hset(vmid, 'dest', path)
-        r.hset(vmid, 'state', 'enqueued')
-        r.sadd('joblock', vmid)
-
-        return {'status': "restore job created for CTID {}".format(vmid)}, 202
-
 class Restorev2(Resource):
     @auth.login_required
     def post(self, vmid):
@@ -249,13 +166,13 @@ class Restorev2(Resource):
         if 'dest' in request.args:
             result, response, err = checkDest(request.args['dest'])
             if result:
-                path = locations[request.args['dest']]
+                path = barque_storage[local_cluster][request.args['dest']]
             else:
                 return response, err
         else:
-            result, response, err = checkDest(locations.keys()[-1])
+            result, response, err = checkDest('default')
             if result:
-                path = locations[locations.keys()[-1]]
+                path = barque_storage[local_cluster]['default']
             else:
                 return response, err
         # check if file specified
@@ -300,13 +217,13 @@ class ListAllBackups(Resource):
         if 'dest' in request.args:
             result, response, err = checkDest(request.args['dest'])
             if result:
-                path = locations[request.args['dest']]
+                path = barque_storage[local_cluster][request.args['dest']]
             else:
                 return response, err
         else:
-            result, response, err = checkDest(locations.keys()[-1])
+            result, response, err = checkDest('default')
             if result:
-                path = locations[locations.keys()[-1]]
+                path = barque_storage[local_cluster]['default']
             else:
                 return response, err
         images = []
@@ -327,13 +244,13 @@ class ListBackups(Resource):
         if 'dest' in request.args:
             result, response, err = checkDest(request.args['dest'])
             if result:
-                path = locations[request.args['dest']]
+                path = barque_storage[local_cluster][request.args['dest']]
             else:
                 return response, err
         else:
-            result, response, err = checkDest(locations.keys()[-1])
+            result, response, err = checkDest('default')
             if result:
-                path = locations[locations.keys()[-1]]
+                path = barque_storage[local_cluster]['default']
             else:
                 return response, err
         files = sorted(os.path.basename(f) for f in glob("".join([path, "vm-{}-disk*.lz4".format(vmid)])))
@@ -346,13 +263,13 @@ class ListBackupsv2(Resource):
         if 'dest' in request.args:
             result, response, err = checkDest(request.args['dest'])
             if result:
-                path = locations[request.args['dest']]
+                path = barque_storage[local_cluster][request.args['dest']]
             else:
                 return response, err
         else:
-            result, response, err = checkDest(locations.keys()[-1])
+            result, response, err = checkDest('default')
             if result:
-                path = locations[locations.keys()[-1]]
+                path = barque_storage[local_cluster]['default']
             else:
                 return response, err
         files = sorted(os.path.basename(f) for f in glob("".join([path, "vm-{}-disk*.lz4".format(vmid)])))
@@ -367,13 +284,13 @@ class DeleteBackup(Resource):
         if 'dest' in request.args:
             result, response, err = checkDest(request.args['dest'])
             if result:
-                path = locations[request.args['dest']]
+                path = barque_storage[local_cluster][request.args['dest']]
             else:
                 return response, err
         else:
-            result, response, err = checkDest(locations.keys()[-1])
+            result, response, err = checkDest('default')
             if result:
-                path = locations[locations.keys()[-1]]
+                path = barque_storage[local_cluster]['default']
             else:
                 return response, err
         if 'file' in request.args:
@@ -528,8 +445,8 @@ class Info(Resource):
         print(workerTask)
         # destination status
         dests = {}
-        for spot in locations.keys():
-            if os.path.isdir(locations[spot]):
+        for spot in barque_storage[local_cluster].keys():
+            if os.path.isdir(barque_storage[local_cluster][spot]):
                 healthy = "OK"
             else:
                 healthy = "Down"
@@ -656,7 +573,7 @@ class MigrateV2(Resource):
             return {'error': "{} is not a valid CTID"}, 400
         # Check if cluster is specified
         if 'cluster' not in request.args:
-            return {'error': 'Resource requires a cluster argument (dtla01, dtla02, dtla03, dtla04, ny01)'}, 400
+            return {'error': 'Resource requires a cluster argument {}'.format(barque_storage.keys())}, 400
         # clear error and try again if retry flag in request args
         if 'retry' in request.args and r.hget(vmid, 'state') == 'error':
             r.srem('joblock', vmid)
@@ -666,19 +583,13 @@ class MigrateV2(Resource):
             return {'error': "VMID locked, another operation is in progress for container: {}".format(vmid)}, 409
 
         # handle destination setting
-        path = None
-        if 'dest' in request.args:
-            result, response, err = checkDest(request.args['dest'])
-            if result:
-                path = locations[request.args['dest']]
-            else:
-                return response, err
+
+        path = ""
+        result, _, _ = checkDest('default')
+        if result:
+            path = barque_storage[local_cluster]['default']
         else:
-            result, response, err = checkDest(locations.keys()[-1])
-            if result:
-                path = locations[locations.keys()[-1]]
-            else:
-                return response, err
+            return response, err
 
         #determine remote host IP
 
@@ -696,7 +607,7 @@ class MigrateV2(Resource):
         else:
             r.hset(vmid, 'state', 'error')
             r.hset(vmid, 'msg', 'Cluster region not configured')
-        target_path = barque_storage[request.args['cluster'].lower()]
+        target_path = barque_storage[request.args['cluster'].lower()][request.args['dest']]
 
         r.hset(vmid, 'dest', path)
         r.hset(vmid, 'target_ip', target_ip)
@@ -880,8 +791,8 @@ def checkConf(vmid):
 
 
 def checkDest(dest):
-    if dest in locations:
-        directory = locations[dest]
+    if dest in barque_storage[local_cluster]:
+        directory = barque_storage[local_cluster][dest]
         if os.path.exists(directory):
             return True, None, None
         else:
@@ -924,7 +835,7 @@ if __name__ == '__main__':
                                 0,
                                 barque_ips,
                                 barque_storage,
-                                locations)
+                                local_cluster)
         workers.append(p)
         p.start()
         log.debug("worker started")

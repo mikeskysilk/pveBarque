@@ -605,6 +605,7 @@ class Worker(multiprocessing.Process):
             details['ceph_vmdisk'],     #
             details['ha_group'])        #
 
+        target.ha_remove()
         target.stop()
         target.snapshot_protect(UNDO)
         target.snapshot_create(UNDO)
@@ -651,8 +652,8 @@ class Worker(multiprocessing.Process):
         return
 
     def checkDest(self, dest):
-        if dest in self.locations:
-            directory = self.locations[dest]
+        if dest in self.barque_storage[local_cluster]:
+            directory = self.barque_storage[local_cluster][dest]
             if os.path.exists(directory):
                 return True, None, None
             else:
@@ -667,7 +668,7 @@ class Worker(multiprocessing.Process):
             return False, {'error': '{} is not a configured destination'
                            ''.format(dest)}, 400
 
-    def __init__(self, proxmox_host, proxmox_user, proxmox_password, r_host, r_port, r_pw, r_db, barque_ips, barque_storage, locations):
+    def __init__(self, proxmox_host, proxmox_user, proxmox_password, r_host, r_port, r_pw, r_db, barque_ips, barque_storage, local_cluster):
         super(Worker, self).__init__()
         self.proxmox_host = proxmox_host
         self.proxmox_user = proxmox_user
@@ -678,4 +679,4 @@ class Worker(multiprocessing.Process):
         self.r_db = r_db
         self.barque_ips = barque_ips
         self.barque_storage = barque_storage
-        self.locations = locations
+        self.local_cluster = local_cluster
