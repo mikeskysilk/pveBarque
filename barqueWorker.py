@@ -463,15 +463,14 @@ class Worker(multiprocessing.Process):
         migration_rate = '50'
 
         cmd = subprocess.check_output(
-                "ssh root@{} \"cat {}{}\" | mbuffer -r {}M | lz4 -d - {}{}.img".format(r.hget(vmid, 'target_ip'),
-                                                                                       r.hget(
-                                                                                           vmid, 'target_path'),
-                                                                                       r.hget(
-                                                                                           vmid, 'file'),
-                                                                                       migration_rate,
-                                                                                       r.hget(
-                                                                                           vmid, 'dest'),
-                                                                                       vmid), shell=True)
+            "ssh root@{} \"cat {}{}\" | mbuffer -r {}M | lz4 -d - {}{}.img".format(
+                r.hget(vmid, 'target_ip'),
+                r.hget(vmid, 'target_path'),
+                r.hget(vmid, 'file'),
+                migration_rate,
+                r.hget(vmid, 'dest'),
+                vmid),
+            shell=True)
         target = barqueTarget.Target(
             vmid,
             details['resource_type'],   #
@@ -571,6 +570,9 @@ class Worker(multiprocessing.Process):
         self.stick.debug("{}:migrate -- {}".format(vmid, msg))
         r.hset(vmid, 'msg', msg)
         err, msg = target.update_config_disk()
+        self.stick.debug("{}:migrate -- {}".format(vmid, msg))
+        r.hset(vmid, 'msg', msg)
+        err, msg = target.update_config_ostype()
         self.stick.debug("{}:migrate -- {}".format(vmid, msg))
         r.hset(vmid, 'msg', msg)
         # err, msg = target.create_config()

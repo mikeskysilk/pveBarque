@@ -1,5 +1,9 @@
 # pveBarque
-Standalone API for backup and restore of ceph vm images
+Asynchronous Flask service used to replace the vzdump feature included with Proxmox for systems using Ceph storage.
+This service provides basic orchestration and management of backups, restorations, migration between clusters,
+in addition to management certain applications specifically implemented by skysilk.
 
-Inspired by [eve4pve-barc](https://github.com/EnterpriseVE/eve4pve-barc) by Daniele Corsini, this API is intended to provide basic orchestration of backups, restorations, and possibly snapshots as well as providing information regarding backup status and lists.
-This is being developed for an environment in which one Proxmox VE node is dedicated for storage and connected to the ceph cluster, though it could be used on a node with load. However no optimizations for performance, efficiency, and niceness are being planned explicitly. 
+This application must be installed on a Proxmox node connected to the ceph cluster. Additionally, it uses the
+clustered file system to access configuration files found on other proxmox nodes rather than the Proxmox API.
+A Redis database is required for storing application state. A configurable number of worker processes are 
+spawned by the main process, and each worker process independently checks application state and performs work.
