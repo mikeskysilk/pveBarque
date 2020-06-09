@@ -56,7 +56,7 @@ for item in config['barque_ips'].items():
 #         pmx_clusters[r][c] = {}
 #     pmx_clusters[r][c][n]=v
 _password = config['proxmox']['password']
-version = '0.12.11'
+version = '0.12.12'
 starttime = None
 
 # global vars

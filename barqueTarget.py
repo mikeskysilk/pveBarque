@@ -20,7 +20,8 @@ class Target():
     Each operation resturns boolean error and string message.
     """
 
-    def __init__(self, vmid, resource_type, host, destination, file_target, proxconn, ceph_pool, ceph_vmdisk, ha_group):
+    def __init__(self, vmid, resource_type, host, destination, file_target,
+                 proxconn, ceph_pool, ceph_vmdisk, ha_group, target_path=None):
         """Return a Target object whose proxmox vmid is *vmid*, job type is
         *job*, resource type (ct||vm) is *resource_type*, configured storage
         destination is *destination*, file target is *file_target*, and
@@ -34,6 +35,7 @@ class Target():
         self.ceph_pool = ceph_pool
         self.ceph_vmdisk = ceph_vmdisk
         self.ha_group = ha_group
+        self.target_path = target_path
         self.client = paramiko.SSHClient()
         self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
@@ -476,12 +478,12 @@ class Target():
         # Get ostype from source config file
         config_ostype = ""
         try:
-            backup_config_file = open("".join((self.destination,
+            backup_config_file = open("".join((self.target_path,
                                                self.file_target.split('.')[0],
                                                ".conf")),
                                       "r")
-        except Exception:
-            return True, "Unable to read source backup config file"
+        except Exception as e:
+            return True, "Unable to read source backup config file: {}".format(e)
         # retrieve ostype parameter from file
         try:
             for line in backup_config_file:

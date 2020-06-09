@@ -480,7 +480,8 @@ class Worker(multiprocessing.Process):
             details['proxconn'],        #
             details['ceph_pool'],       #
             details['ceph_vmdisk'],     #
-            details['ha_group'])        #
+            details['ha_group'],        #
+            r.hget(vmid, 'target_path')) #
 
         target.ha_remove()  # pass on error, may already have been removed
         error, msg = target.stop()
