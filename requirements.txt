@@ -1,0 +1,4 @@
+redis
+proxmoxer
+flask_httpauth
+flask_restful
