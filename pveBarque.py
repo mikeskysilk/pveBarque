@@ -56,7 +56,7 @@ for item in config['barque_ips'].items():
 #         pmx_clusters[r][c] = {}
 #     pmx_clusters[r][c][n]=v
 _password = config['proxmox']['password']
-version = '0.12.12'
+version = '0.12.13'
 starttime = None
 
 # global vars
@@ -130,7 +130,7 @@ class BackupAll(Resource):
         if 'dest' in request.args:
             result, response, err = checkDest(request.args['dest'])
             if result:
-                dest = barque_storage[request.args['dest']]
+                dest = barque_storage[local_cluster][request.args['dest']]
             else:
                 return response, err
         else:
@@ -147,6 +147,8 @@ class BackupAll(Resource):
         for vmid in targets:
             if str(vmid) in r.smembers('joblock'):
                 response.append({vmid: {"status": "error", "message": "CTID locked, another operation is in progress"}})
+            elif not checkConfv2(vmid):
+            	continue
             else:
                 r.hset(vmid, 'job', 'backup')
                 r.hset(vmid, 'file', '')
@@ -529,7 +531,7 @@ class AVtoggle(Resource):
         elif 'scanning is not running' in active:
             return {'active': False, 'status': active, "locked_by": locked_by}, 200
         else:
-            return {'error': "Problem determining AV status"}, 500
+            return {'error': "Problem determining AV status"}, 200
 
 
 class Migrate(Resource):
